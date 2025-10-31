@@ -13,17 +13,25 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true ,
+       "infoPlist": {
+        "NSCameraUsageDescription": "แอปต้องการใช้กล้องเพื่อสแกนบาร์โค้ด",
+        "NSUserTrackingUsageDescription": "ใช้เพื่อปรับปรุงประสบการณ์แจ้งเตือน"
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#ffffff" ,
+        "permissions": ["CAMERA", "POST_NOTIFICATIONS"]
       },
       "edgeToEdgeEnabled": true
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-barcode-scanner"
+    ]
   }
 }
