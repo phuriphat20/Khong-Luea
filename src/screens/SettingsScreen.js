@@ -9,16 +9,18 @@ import {
   Alert,
 } from "react-native";
 import AppCtx from "../context/AppContext";
-import { auth, db } from "../services/firebaseConnected";
+import { db } from "../services/firebaseConnected";
 import {
   doc,
   getDoc,
   setDoc,
-  serverTimestamp,
   updateDoc,
+  serverTimestamp,
   collection,
   addDoc,
 } from "firebase/firestore";
+
+const DEFAULT_FRIDGE_NAME = "My Fridge";
 
 export default function SettingsScreen() {
   const { user, profile, setProfile, signOut } = useContext(AppCtx);
@@ -36,9 +38,9 @@ export default function SettingsScreen() {
       const fRef = doc(db, "fridges", profile.currentFridgeId);
       const fSnap = await getDoc(fRef);
       if (fSnap.exists()) {
-        const d = fSnap.data();
-        setFridgeName(prev => prev || d.name || '');
-        setInviteCode(d.inviteCode || "");
+        const data = fSnap.data();
+        setFridgeName((prev) => prev || data.name || "");
+        setInviteCode(data.inviteCode || "");
       }
     })();
   }, [profile?.currentFridgeId]);
@@ -47,77 +49,77 @@ export default function SettingsScreen() {
     try {
       const code = Math.random().toString(36).slice(2, 8).toUpperCase();
       const fRef = await addDoc(collection(db, "fridges"), {
-        name: fridgeName || "ตู้เย็นบ้าน",
+        name: fridgeName || DEFAULT_FRIDGE_NAME,
         ownerUid: user.uid,
         inviteCode: code,
         createdAt: serverTimestamp(),
       });
-      // เพิ่ม members/{uid}
+
       await setDoc(doc(db, "fridges", fRef.id, "members", user.uid), {
         role: "owner",
         joinedAt: serverTimestamp(),
       });
-      // set users/{uid}.currentFridgeId
+
       const uRef = doc(db, "users", user.uid);
       await updateDoc(uRef, { currentFridgeId: fRef.id });
       const newProfile = (await getDoc(uRef)).data();
       setProfile(newProfile);
-      Alert.alert("สร้างตู้เย็นสำเร็จ", `รหัสเชิญ: ${code}`);
+      setInviteCode(code);
+      Alert.alert("Fridge created", `Invite code: ${code}`);
     } catch (e) {
-      Alert.alert("ไม่สำเร็จ", e.message);
+      Alert.alert("Could not create fridge", e.message);
     }
   };
 
   const joinFridge = async () => {
     try {
-      // หา fridge จาก inviteCode (ตัวอย่างแบบง่าย: ดึงทั้งหมดแล้วกรอง ควรทำด้วย query index ในโปรดักชัน)
-      // เพื่อความสั้น จะสาธิตแบบใช้ getDoc ถ้ารู้ ID หรือให้ user วาง ID ตรง ๆ
-      // ที่นี่เราจะลองใช้ input เป็น inviteCode -> dev จริงควร query collection ด้วย where('inviteCode','==',joinCode)
       Alert.alert(
-        "แนวทาง",
-        "โปรดปรับเป็น query Firestore ด้วย where(inviteCode == joinCode) ในโปรดักชัน"
+        "Implement me",
+        "Update this flow to look up fridges by invite code and add the current user."
       );
     } catch (e) {
-      Alert.alert("ไม่สำเร็จ", e.message);
+      Alert.alert("Could not join fridge", e.message);
     }
   };
 
   return (
     <View style={s.container}>
-      <Text style={s.title}>ตั้งค่า</Text>
-      <Text style={s.label}>ผู้ใช้: {profile?.displayName || user?.email}</Text>
+      <Text style={s.title}>Settings</Text>
+      <Text style={s.label}>
+        User: {profile?.displayName || user?.email || "Unknown"}
+      </Text>
 
       <View style={s.box}>
-        <Text style={s.boxTitle}>ตู้เย็นปัจจุบัน</Text>
-        <Text style={{ color: "#666", marginBottom: 8 }}>
+        <Text style={s.boxTitle}>Current fridge</Text>
+        <Text style={s.muted}>
           {profile?.currentFridgeId
             ? `ID: ${profile.currentFridgeId}`
-            : "ยังไม่ผูกตู้เย็น"}
+            : "No fridge linked yet"}
         </Text>
 
         <TextInput
           style={s.input}
-          placeholder="ชื่อตู้เย็น (ตอนสร้างใหม่)"
+          placeholder="Fridge name (when creating)"
           value={fridgeName}
           onChangeText={setFridgeName}
         />
         <TouchableOpacity style={s.btn} onPress={createFridge}>
-          <Text style={s.btnText}>สร้างตู้เย็นใหม่ + ผูกให้ฉัน</Text>
+          <Text style={s.btnText}>Create and link a fridge</Text>
         </TouchableOpacity>
 
         {inviteCode ? (
-          <Text style={{ marginTop: 8 }}>
-            รหัสเชิญของตู้เย็นนี้:{" "}
-            <Text style={{ fontWeight: "700" }}>{inviteCode}</Text>
+          <Text style={s.muted}>
+            Invite code for this fridge:{" "}
+            <Text style={s.code}>{inviteCode}</Text>
           </Text>
         ) : null}
       </View>
 
       <View style={s.box}>
-        <Text style={s.boxTitle}>เข้าร่วมตู้เย็นด้วยรหัสเชิญ</Text>
+        <Text style={s.boxTitle}>Join by invite code</Text>
         <TextInput
           style={s.input}
-          placeholder="ใส่รหัสเชิญ เช่น ABX4F7"
+          placeholder="Invite code, e.g. ABX4F7"
           value={joinCode}
           onChangeText={setJoinCode}
           autoCapitalize="characters"
@@ -126,7 +128,7 @@ export default function SettingsScreen() {
           style={[s.btn, { backgroundColor: "#9b59b6" }]}
           onPress={joinFridge}
         >
-          <Text style={s.btnText}>เข้าร่วม</Text>
+          <Text style={s.btnText}>Join fridge</Text>
         </TouchableOpacity>
       </View>
 
@@ -134,7 +136,7 @@ export default function SettingsScreen() {
         style={[s.btn, { backgroundColor: "#eb5757", marginTop: 12 }]}
         onPress={signOut}
       >
-        <Text style={s.btnText}>ออกจากระบบ</Text>
+        <Text style={s.btnText}>Sign out</Text>
       </TouchableOpacity>
     </View>
   );
@@ -152,6 +154,8 @@ const s = StyleSheet.create({
     marginTop: 16,
   },
   boxTitle: { fontWeight: "700", marginBottom: 8 },
+  muted: { color: "#666", marginBottom: 8 },
+  code: { fontWeight: "700" },
   input: {
     borderWidth: 1,
     borderColor: "#ddd",
@@ -162,3 +166,4 @@ const s = StyleSheet.create({
   btn: { backgroundColor: "#2d9cdb", padding: 12, borderRadius: 10 },
   btnText: { color: "#fff", textAlign: "center", fontWeight: "700" },
 });
+
