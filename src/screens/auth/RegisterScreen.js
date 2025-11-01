@@ -1,4 +1,4 @@
-// src/screens/RegisterScreen.js
+// src/screens/auth/RegisterScreen.js
 import { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
 import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth';
@@ -20,27 +20,26 @@ export default function RegisterScreen({ navigation }) {
         displayName: name || email.split('@')[0],
         email: email.trim(),
         currentFridgeId: null,
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
       });
-      // กลับไปหน้าหลักเองหลัง auth เปลี่ยน
     } catch (e) {
-      Alert.alert('สมัครสมาชิกไม่สำเร็จ', e.message);
+      Alert.alert('Sign up failed', e.message);
     }
   };
 
   return (
     <View style={s.container}>
-      <Text style={s.title}>สมัครสมาชิก</Text>
+      <Text style={s.title}>Create an account</Text>
 
       <TextInput
         style={s.input}
-        placeholder="ชื่อที่แสดง"
+        placeholder="Display name"
         value={name}
         onChangeText={setName}
       />
       <TextInput
         style={s.input}
-        placeholder="อีเมล"
+        placeholder="Email"
         autoCapitalize="none"
         keyboardType="email-address"
         value={email}
@@ -48,28 +47,29 @@ export default function RegisterScreen({ navigation }) {
       />
       <TextInput
         style={s.input}
-        placeholder="รหัสผ่าน (อย่างน้อย 6 ตัว)"
+        placeholder="Password (at least 6 characters)"
         secureTextEntry
         value={pw}
         onChangeText={setPw}
       />
 
       <TouchableOpacity style={s.btn} onPress={onRegister}>
-        <Text style={s.btnText}>สร้างบัญชี</Text>
+        <Text style={s.btnText}>Sign Up</Text>
       </TouchableOpacity>
 
       <TouchableOpacity onPress={() => navigation.goBack()}>
-        <Text style={s.link}>มีบัญชีอยู่แล้ว? เข้าสู่ระบบ</Text>
+        <Text style={s.link}>Already have an account? Sign in</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
 const s = StyleSheet.create({
-  container:{ flex:1, padding:24, justifyContent:'center' },
-  title:{ fontSize:24, fontWeight:'700', textAlign:'center', marginBottom:16 },
-  input:{ borderWidth:1, borderColor:'#ddd', borderRadius:10, padding:12, marginBottom:12 },
-  btn:{ backgroundColor:'#27ae60', padding:14, borderRadius:10, marginTop:4 },
-  btnText:{ color:'#fff', textAlign:'center', fontWeight:'700' },
-  link:{ marginTop:16, textAlign:'center', color:'#2f80ed' }
+  container: { flex: 1, padding: 24, justifyContent: 'center' },
+  title: { fontSize: 24, fontWeight: '700', textAlign: 'center', marginBottom: 16 },
+  input: { borderWidth: 1, borderColor: '#ddd', borderRadius: 10, padding: 12, marginBottom: 12 },
+  btn: { backgroundColor: '#27ae60', padding: 14, borderRadius: 10, marginTop: 4 },
+  btnText: { color: '#fff', textAlign: 'center', fontWeight: '700' },
+  link: { marginTop: 16, textAlign: 'center', color: '#2f80ed' },
 });
+

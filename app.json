@@ -13,17 +13,17 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true ,
-       "infoPlist": {
-        "NSCameraUsageDescription": "แอปต้องการใช้กล้องเพื่อสแกนบาร์โค้ด",
-        "NSUserTrackingUsageDescription": "ใช้เพื่อปรับปรุงประสบการณ์แจ้งเตือน"
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "The app needs camera access to scan barcodes and manage stock.",
+        "NSUserTrackingUsageDescription": "We use this data to improve your experience and deliver relevant notifications."
       }
     },
     "android": {
+      "permissions": ["CAMERA", "POST_NOTIFICATIONS"],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff" ,
-        "permissions": ["CAMERA", "POST_NOTIFICATIONS"]
+        "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true
     },
