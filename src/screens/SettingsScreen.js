@@ -72,6 +72,7 @@ export default function SettingsScreen() {
       return;
     }
 
+    
     try {
       setJoining(true);
       await joinFridge(trimmed);

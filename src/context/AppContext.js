@@ -24,6 +24,7 @@ import {
 } from "firebase/firestore";
 import { auth, db } from "../services/firebaseConnected";
 
+
 const AppContext = createContext({
   user: null,
   profile: null,
@@ -453,6 +454,7 @@ export function AppProvider({ children }) {
       setCurrentFridge,
       signOut: handleSignOut,
     }),
+    
     [
       user,
       profile,
