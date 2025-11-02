@@ -16,7 +16,7 @@ import {
   Pressable,
 } from "react-native";
 import AppCtx from "../context/AppContext";
-import { db } from "../services/firebaseConnected";
+import { auth, db } from "../services/firebaseConnected";
 import { writeBatch } from "firebase/firestore";
 import {
   collection,
@@ -80,6 +80,18 @@ const copyCode = async (fid) => {
     // map เก็บ unsubscribe ของ stock แต่ละตู้ เพื่อจัดการตอนสมาชิกเปลี่ยน
     const stockUnsubs = new Map(); // fid -> () => void
 
+    const sortFridgesByCreated = (list) =>
+      list
+        .slice()
+        .sort((a, b) => {
+          const aTime = typeof a.createdAt === "number" ? a.createdAt : 0;
+          const bTime = typeof b.createdAt === "number" ? b.createdAt : 0;
+          if (aTime !== bTime) return aTime - bTime;
+          const idA = a.id || "";
+          const idB = b.id || "";
+          return idA.localeCompare(idB);
+        });
+
     // helper: ดึงข้อมูลตู้ + นับสมาชิก + สมัครฟัง stock
     const attachFridge = async (fid) => {
       // ถ้ามีแล้ว ไม่ต้องซ้ำ
@@ -98,16 +110,23 @@ const copyCode = async (fid) => {
       // 3) set state โครงเริ่มต้น
       setFridges((prev) => {
         const idx = prev.findIndex((x) => x.id === fid);
-        const row = {
+        const createdAt =
+          typeof fdata?.createdAt?.toMillis === "function" ? fdata.createdAt.toMillis() : 0;
+        const baseRow = {
           id: fid,
           name: fdata.name || "-",
-          counts: { all: 0, expSoon: 0, low: 0 },
+          inviteCode: fdata.inviteCode || "",
+          createdAt,
           memberCount,
         };
-        if (idx === -1) return [...prev, row];
+        if (idx === -1)
+          return sortFridgesByCreated([
+            ...prev,
+            { ...baseRow, counts: { all: 0, expSoon: 0, low: 0 } },
+          ]);
         const copy = prev.slice();
-        copy[idx] = { ...copy[idx], ...row };
-        return copy;
+        copy[idx] = { ...copy[idx], ...baseRow };
+        return sortFridgesByCreated(copy);
       });
 
       // 4) subscribe stock ของตู้
@@ -243,6 +262,8 @@ const createFridge = async () => {
   setSaving(true);
 
   try {
+    const ownerUid = auth.currentUser?.uid || user?.uid;
+    if (!ownerUid) throw new Error("Unable to determine current user");
     // 1) หา code ที่ยังไม่ถูกใช้
     let code = "";
     for (let i = 0; i < 5; i++) {
@@ -258,18 +279,18 @@ const createFridge = async () => {
 
     batch.set(fRef, {
       name,
-      ownerUid: user.uid,
+      ownerUid: ownerUid,
       inviteCode: code,              // ← เก็บลงตู้ด้วย
       createdAt: serverTimestamp(),
     });
 
-    batch.set(doc(db, "fridges", fRef.id, "members", user.uid), {
-      uid: user.uid,
+    batch.set(doc(db, "fridges", fRef.id, "members", ownerUid), {
+      uid: ownerUid,
       role: "owner",
       joinedAt: serverTimestamp(),
     });
 
-    batch.set(doc(db, "users", user.uid, "memberships", fRef.id), {
+    batch.set(doc(db, "users", ownerUid, "memberships", fRef.id), {
       fridgeId: fRef.id,
       role: "owner",
       addedAt: serverTimestamp(),
@@ -278,13 +299,22 @@ const createFridge = async () => {
     // map code → fid
 batch.set(doc(db, "inviteCodes", code), {
   fridgeId: fRef.id,
-  createdBy: user.uid,     // ← ใช้ตรวจสิทธิ์ตาม rules ใหม่
+  createdBy: ownerUid,     // ← ใช้ตรวจสิทธิ์ตาม rules ใหม่
   active: true,
   createdAt: serverTimestamp(),
 });
 
 
     await batch.commit();
+    await setDoc(
+      doc(db, "fridges", fRef.id, "members", ownerUid),
+      {
+        uid: ownerUid,
+        role: "owner",
+        joinedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
     setNewFridgeName("");
     setShowCreate(false);
   } catch (e) {
