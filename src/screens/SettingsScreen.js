@@ -1,169 +1,350 @@
-// src/screens/SettingsScreen.js
+// SettingsScreen.js
 import { useContext, useEffect, useState } from "react";
 import {
-  View,
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  StyleSheet,
-  Alert,
+  View,
 } from "react-native";
-import AppCtx from "../context/AppContext";
-import { db } from "../services/firebaseConnected";
 import {
+  collection,
   doc,
   getDoc,
-  setDoc,
+  getDocs,
+  query,
   updateDoc,
-  serverTimestamp,
-  collection,
-  addDoc,
+  where,
 } from "firebase/firestore";
-
-const DEFAULT_FRIDGE_NAME = "My Fridge";
+import AppCtx from "../context/AppContext";
+import { db } from "../services/firebaseConnected";
 
 export default function SettingsScreen() {
+  // Pull the signed-in user and their profile from global context.
   const { user, profile, setProfile, signOut } = useContext(AppCtx);
-  const [fridgeName, setFridgeName] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
-  const [joinCode, setJoinCode] = useState("");
 
+  // Store loading state while we fetch the connected fridge document.
+  const [fridgeLoading, setFridgeLoading] = useState(false);
+  const [fridgeError, setFridgeError] = useState(null);
+  const [fridge, setFridge] = useState(null);
+
+  // Track the invite code the user wants to join with.
+  const [inviteCode, setInviteCode] = useState("");
+  const [joining, setJoining] = useState(false);
+
+  // Whenever the currentFridgeId changes, load the latest fridge info.
   useEffect(() => {
-    (async () => {
+    let active = true;
+
+    const loadFridge = async () => {
       if (!profile?.currentFridgeId) {
-        setFridgeName("");
-        setInviteCode("");
+        if (!active) return;
+        setFridge(null);
+        setFridgeError(null);
+        setFridgeLoading(false);
         return;
       }
-      const fRef = doc(db, "fridges", profile.currentFridgeId);
-      const fSnap = await getDoc(fRef);
-      if (fSnap.exists()) {
-        const data = fSnap.data();
-        setFridgeName((prev) => prev || data.name || "");
-        setInviteCode(data.inviteCode || "");
+
+      setFridgeLoading(true);
+      setFridgeError(null);
+
+      try {
+        const fridgeRef = doc(db, "fridges", profile.currentFridgeId);
+        const snap = await getDoc(fridgeRef);
+
+        if (!active) return;
+
+        if (snap.exists()) {
+          setFridge({ id: snap.id, ...snap.data() });
+        } else {
+          setFridge(null);
+          setFridgeError("We could not find this fridge. Ask the owner to re-invite you.");
+        }
+      } catch (err) {
+        if (!active) return;
+        console.warn("load fridge failed", err);
+        setFridge(null);
+        setFridgeError(err?.message || "Something went wrong while loading the fridge.");
+      } finally {
+        if (active) {
+          setFridgeLoading(false);
+        }
       }
-    })();
+    };
+
+    loadFridge();
+
+    return () => {
+      active = false;
+    };
   }, [profile?.currentFridgeId]);
 
-  const createFridge = async () => {
-    try {
-      const code = Math.random().toString(36).slice(2, 8).toUpperCase();
-      const fRef = await addDoc(collection(db, "fridges"), {
-        name: fridgeName || DEFAULT_FRIDGE_NAME,
-        ownerUid: user.uid,
-        inviteCode: code,
-        createdAt: serverTimestamp(),
-      });
-
-      await setDoc(doc(db, "fridges", fRef.id, "members", user.uid), {
-        role: "owner",
-        joinedAt: serverTimestamp(),
-      });
-
-      const uRef = doc(db, "users", user.uid);
-      await updateDoc(uRef, { currentFridgeId: fRef.id });
-      const newProfile = (await getDoc(uRef)).data();
-      setProfile(newProfile);
-      setInviteCode(code);
-      Alert.alert("Fridge created", `Invite code: ${code}`);
-    } catch (e) {
-      Alert.alert("Could not create fridge", e.message);
+  // Let members join a fridge by invite code and update their profile.
+  const handleJoinFridge = async () => {
+    const cleanedCode = inviteCode.trim().toUpperCase();
+    if (!cleanedCode) {
+      Alert.alert("Invite Code Needed", "Enter the invite code you received to continue.");
+      return;
     }
-  };
+    if (!user?.uid) {
+      Alert.alert("Not Signed In", "Please sign in again before joining a fridge.");
+      return;
+    }
 
-  const joinFridge = async () => {
     try {
-      Alert.alert(
-        "Implement me",
-        "Update this flow to look up fridges by invite code and add the current user."
+      setJoining(true);
+      const fridgeQuery = query(
+        collection(db, "fridges"),
+        where("inviteCode", "==", cleanedCode)
       );
-    } catch (e) {
-      Alert.alert("Could not join fridge", e.message);
+      const snap = await getDocs(fridgeQuery);
+
+      if (snap.empty) {
+        Alert.alert("Code Not Found", "Double-check the invite code and try again.");
+        return;
+      }
+
+      const fridgeDoc = snap.docs[0];
+      const fridgeId = fridgeDoc.id;
+
+      await updateDoc(doc(db, "users", user.uid), {
+        currentFridgeId: fridgeId,
+      });
+
+      if (typeof setProfile === "function") {
+        setProfile((prev) =>
+          prev ? { ...prev, currentFridgeId: fridgeId } : prev
+        );
+      }
+
+      setInviteCode("");
+
+      Alert.alert(
+        "Fridge Linked",
+        `You're now connected to “${fridgeDoc.data()?.name || "your fridge"}”.`
+      );
+    } catch (err) {
+      console.warn("join fridge failed", err);
+      Alert.alert(
+        "Unable to Join",
+        err?.message || "We ran into a problem linking this fridge. Try again."
+      );
+    } finally {
+      setJoining(false);
     }
   };
+
+  const displayName =
+    profile?.displayName || user?.email?.split("@")[0] || "Member";
+  const emailAddress = profile?.email || user?.email || "No email available";
+  const inviteDisabled = joining || !inviteCode.trim();
 
   return (
-    <View style={s.container}>
-      <Text style={s.title}>Settings</Text>
-      <Text style={s.label}>
-        User: {profile?.displayName || user?.email || "Unknown"}
-      </Text>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+    >
+      {/* Header */}
+      <Text style={styles.header}>Settings</Text>
 
-      <View style={s.box}>
-        <Text style={s.boxTitle}>Current fridge</Text>
-        <Text style={s.muted}>
-          {profile?.currentFridgeId
-            ? `ID: ${profile.currentFridgeId}`
-            : "No fridge linked yet"}
-        </Text>
-
-        <TextInput
-          style={s.input}
-          placeholder="Fridge name (when creating)"
-          value={fridgeName}
-          onChangeText={setFridgeName}
-        />
-        <TouchableOpacity style={s.btn} onPress={createFridge}>
-          <Text style={s.btnText}>Create and link a fridge</Text>
-        </TouchableOpacity>
-
-        {inviteCode ? (
-          <Text style={s.muted}>
-            Invite code for this fridge:{" "}
-            <Text style={s.code}>{inviteCode}</Text>
-          </Text>
-        ) : null}
+      {/* Account details */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Your Account</Text>
+        <View style={styles.row}>
+          <Text style={styles.label}>Name</Text>
+          <Text style={styles.value}>{displayName}</Text>
+        </View>
+        <View style={styles.row}>
+          <Text style={styles.label}>Email</Text>
+          <Text style={styles.value}>{emailAddress}</Text>
+        </View>
       </View>
 
-      <View style={s.box}>
-        <Text style={s.boxTitle}>Join by invite code</Text>
+      {/* Fridge status */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Current Fridge</Text>
+        {fridgeLoading ? (
+          <View style={styles.loadingRow}>
+            <ActivityIndicator size="small" color="#2563EB" />
+            <Text style={styles.loadingText}>Loading fridge details…</Text>
+          </View>
+        ) : !profile?.currentFridgeId ? (
+          <Text style={styles.emptyText}>No fridge linked yet.</Text>
+        ) : fridge ? (
+          <>
+            <View style={styles.row}>
+              <Text style={styles.label}>Name</Text>
+              <Text style={styles.value}>{fridge.name || "Unnamed fridge"}</Text>
+            </View>
+            <View style={styles.row}>
+              <Text style={styles.label}>Invite Code</Text>
+              <Text style={styles.codeBadge}>
+                {(fridge.inviteCode || "").toUpperCase() || "N/A"}
+              </Text>
+            </View>
+          </>
+        ) : (
+          <>
+            <Text style={styles.emptyText}>We could not load this fridge.</Text>
+            {fridgeError ? (
+              <Text style={styles.errorText}>{fridgeError}</Text>
+            ) : null}
+          </>
+        )}
+      </View>
+
+      {/* Join fridge form */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Join a Fridge</Text>
+        <Text style={styles.helpText}>
+          Enter the invite code shared by the fridge owner to link it to your
+          account.
+        </Text>
         <TextInput
-          style={s.input}
-          placeholder="Invite code, e.g. ABX4F7"
-          value={joinCode}
-          onChangeText={setJoinCode}
+          value={inviteCode}
+          onChangeText={setInviteCode}
           autoCapitalize="characters"
+          autoCorrect={false}
+          placeholder="INVITE"
+          style={styles.input}
+          editable={!joining}
         />
         <TouchableOpacity
-          style={[s.btn, { backgroundColor: "#9b59b6" }]}
-          onPress={joinFridge}
+          style={[styles.button, inviteDisabled && styles.buttonDisabled]}
+          onPress={handleJoinFridge}
+          disabled={inviteDisabled}
         >
-          <Text style={s.btnText}>Join fridge</Text>
+          {joining ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.buttonText}>Join Fridge</Text>
+          )}
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity
-        style={[s.btn, { backgroundColor: "#eb5757", marginTop: 12 }]}
-        onPress={signOut}
-      >
-        <Text style={s.btnText}>Sign out</Text>
+      {/* Sign-out */}
+      <TouchableOpacity style={styles.signOutButton} onPress={signOut}>
+        <Text style={styles.signOutText}>Sign Out</Text>
       </TouchableOpacity>
-    </View>
+    </ScrollView>
   );
 }
 
-const s = StyleSheet.create({
-  container: { flex: 1, padding: 16 },
-  title: { fontSize: 20, fontWeight: "700" },
-  label: { marginTop: 6, color: "#666" },
-  box: {
-    borderWidth: 1,
-    borderColor: "#eee",
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 16,
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#F3F4F6",
   },
-  boxTitle: { fontWeight: "700", marginBottom: 8 },
-  muted: { color: "#666", marginBottom: 8 },
-  code: { fontWeight: "700" },
+  content: {
+    paddingHorizontal: 20,
+    paddingVertical: 24,
+  },
+  header: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 20,
+  },
+  card: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 20,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#E5E7EB",
+    shadowColor: "#111827",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 6,
+    elevation: 1,
+  },
+  cardTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1F2937",
+    marginBottom: 12,
+  },
+  row: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  label: {
+    color: "#6B7280",
+    fontWeight: "600",
+  },
+  value: {
+    color: "#111827",
+    fontWeight: "600",
+  },
+  codeBadge: {
+    backgroundColor: "#EEF2FF",
+    color: "#3730A3",
+    fontWeight: "700",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    letterSpacing: 1,
+  },
+  emptyText: {
+    color: "#6B7280",
+    fontStyle: "italic",
+  },
+  errorText: {
+    marginTop: 8,
+    color: "#DC2626",
+  },
+  loadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  loadingText: {
+    marginLeft: 8,
+    color: "#6B7280",
+  },
+  helpText: {
+    color: "#6B7280",
+    marginBottom: 12,
+  },
   input: {
     borderWidth: 1,
-    borderColor: "#ddd",
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 8,
+    borderColor: "#D1D5DB",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 16,
+    letterSpacing: 1,
+    color: "#111827",
   },
-  btn: { backgroundColor: "#2d9cdb", padding: 12, borderRadius: 10 },
-  btnText: { color: "#fff", textAlign: "center", fontWeight: "700" },
+  button: {
+    marginTop: 14,
+    backgroundColor: "#2563EB",
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  buttonDisabled: {
+    backgroundColor: "#93C5FD",
+  },
+  buttonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 16,
+  },
+  signOutButton: {
+    backgroundColor: "#EF4444",
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  signOutText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 16,
+  },
 });
-
