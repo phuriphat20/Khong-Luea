@@ -1,5 +1,5 @@
 // SettingsScreen.js
-import { useContext, useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -10,137 +10,151 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  query,
-  updateDoc,
-  where,
-} from "firebase/firestore";
-import AppCtx from "../context/AppContext";
-import { db } from "../services/firebaseConnected";
+import { useAppContext } from "../context/AppContext";
 
 export default function SettingsScreen() {
-  // Pull the signed-in user and their profile from global context.
-  const { user, profile, setProfile, signOut } = useContext(AppCtx);
+  // Pull global fridge data and helpers from context.
+  const {
+    user,
+    profile,
+    fridges,
+    currentFridge,
+    initializing,
+    updateProfile,
+    joinFridge,
+    leaveFridge,
+    setCurrentFridge,
+    signOut,
+  } = useAppContext();
 
-  // Store loading state while we fetch the connected fridge document.
-  const [fridgeLoading, setFridgeLoading] = useState(false);
-  const [fridgeError, setFridgeError] = useState(null);
-  const [fridge, setFridge] = useState(null);
-
-  // Track the invite code the user wants to join with.
+  // Local edits for profile and invite code handling.
+  const [displayName, setDisplayName] = useState(profile?.displayName || "");
   const [inviteCode, setInviteCode] = useState("");
+  const [savingName, setSavingName] = useState(false);
   const [joining, setJoining] = useState(false);
+  const [settingId, setSettingId] = useState(null);
+  const [leavingId, setLeavingId] = useState(null);
 
-  // Whenever the currentFridgeId changes, load the latest fridge info.
   useEffect(() => {
-    let active = true;
+    setDisplayName(profile?.displayName || "");
+  }, [profile?.displayName]);
 
-    const loadFridge = async () => {
-      if (!profile?.currentFridgeId) {
-        if (!active) return;
-        setFridge(null);
-        setFridgeError(null);
-        setFridgeLoading(false);
-        return;
-      }
+  const emailAddress = profile?.email || user?.email || "Email unavailable";
+  const inviteDisabled = joining || !inviteCode.trim();
 
-      setFridgeLoading(true);
-      setFridgeError(null);
+  const currentFridgeId = profile?.currentFridgeId || null;
 
-      try {
-        const fridgeRef = doc(db, "fridges", profile.currentFridgeId);
-        const snap = await getDoc(fridgeRef);
-
-        if (!active) return;
-
-        if (snap.exists()) {
-          setFridge({ id: snap.id, ...snap.data() });
-        } else {
-          setFridge(null);
-          setFridgeError("We could not find this fridge. Ask the owner to re-invite you.");
-        }
-      } catch (err) {
-        if (!active) return;
-        console.warn("load fridge failed", err);
-        setFridge(null);
-        setFridgeError(err?.message || "Something went wrong while loading the fridge.");
-      } finally {
-        if (active) {
-          setFridgeLoading(false);
-        }
-      }
-    };
-
-    loadFridge();
-
-    return () => {
-      active = false;
-    };
-  }, [profile?.currentFridgeId]);
-
-  // Let members join a fridge by invite code and update their profile.
-  const handleJoinFridge = async () => {
-    const cleanedCode = inviteCode.trim().toUpperCase();
-    if (!cleanedCode) {
-      Alert.alert("Invite Code Needed", "Enter the invite code you received to continue.");
-      return;
-    }
-    if (!user?.uid) {
-      Alert.alert("Not Signed In", "Please sign in again before joining a fridge.");
+  const handleSaveDisplayName = async () => {
+    const trimmed = displayName.trim();
+    if (!trimmed) {
+      Alert.alert("Display name required", "Please enter a display name first.");
       return;
     }
 
     try {
-      setJoining(true);
-      const fridgeQuery = query(
-        collection(db, "fridges"),
-        where("inviteCode", "==", cleanedCode)
-      );
-      const snap = await getDocs(fridgeQuery);
-
-      if (snap.empty) {
-        Alert.alert("Code Not Found", "Double-check the invite code and try again.");
-        return;
-      }
-
-      const fridgeDoc = snap.docs[0];
-      const fridgeId = fridgeDoc.id;
-
-      await updateDoc(doc(db, "users", user.uid), {
-        currentFridgeId: fridgeId,
-      });
-
-      if (typeof setProfile === "function") {
-        setProfile((prev) =>
-          prev ? { ...prev, currentFridgeId: fridgeId } : prev
-        );
-      }
-
-      setInviteCode("");
-
-      Alert.alert(
-        "Fridge Linked",
-        `You're now connected to “${fridgeDoc.data()?.name || "your fridge"}”.`
-      );
+      setSavingName(true);
+      await updateProfile({ displayName: trimmed });
+      Alert.alert("Profile updated", "Your display name has been saved.");
     } catch (err) {
-      console.warn("join fridge failed", err);
       Alert.alert(
-        "Unable to Join",
-        err?.message || "We ran into a problem linking this fridge. Try again."
+        "Update failed",
+        err?.message || "We could not update your profile right now."
+      );
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  const handleJoinFridge = async () => {
+    const trimmed = inviteCode.trim().toUpperCase();
+    if (!trimmed) {
+      Alert.alert("Invite code needed", "Enter an invite code to join a fridge.");
+      return;
+    }
+
+    
+    try {
+      setJoining(true);
+      await joinFridge(trimmed);
+      setInviteCode("");
+      Alert.alert("You're in!", "Fridge joined successfully.");
+    } catch (err) {
+      Alert.alert(
+        "Join failed",
+        err?.message || "We could not join that fridge right now."
       );
     } finally {
       setJoining(false);
     }
   };
 
-  const displayName =
-    profile?.displayName || user?.email?.split("@")[0] || "Member";
-  const emailAddress = profile?.email || user?.email || "No email available";
-  const inviteDisabled = joining || !inviteCode.trim();
+  const handleSetCurrent = async (fridge) => {
+    if (!fridge?.id || fridge.id === currentFridgeId) {
+      return;
+    }
+
+    try {
+      setSettingId(fridge.id);
+      await setCurrentFridge(fridge.id);
+      Alert.alert("Current fridge updated", `Tracking ${fridge.name || "fridge"}.`);
+    } catch (err) {
+      Alert.alert(
+        "Unable to set current fridge",
+        err?.message || "Please try again."
+      );
+    } finally {
+      setSettingId(null);
+    }
+  };
+
+  const confirmLeaveFridge = (fridge) => {
+    if (!fridge?.id) return;
+
+    Alert.alert(
+      "Leave this fridge?",
+      `This will remove your access to ${fridge.name || "this fridge"}.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Leave",
+          style: "destructive",
+          onPress: () => handleLeaveFridge(fridge.id),
+        },
+      ]
+    );
+  };
+
+  const handleLeaveFridge = async (fridgeId) => {
+    try {
+      setLeavingId(fridgeId);
+      await leaveFridge(fridgeId);
+      Alert.alert("Removed", "You no longer have access to that fridge.");
+    } catch (err) {
+      Alert.alert(
+        "Unable to leave",
+        err?.message || "We could not complete that action."
+      );
+    } finally {
+      setLeavingId(null);
+    }
+  };
+
+  const fridgeList = useMemo(
+    () =>
+      fridges.map((fridge) => ({
+        ...fridge,
+        isCurrent: fridge.id === currentFridgeId,
+      })),
+    [fridges, currentFridgeId]
+  );
+
+  if (initializing) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator size="large" color="#2563EB" />
+      </View>
+    );
+  }
 
   return (
     <ScrollView
@@ -148,61 +162,125 @@ export default function SettingsScreen() {
       contentContainerStyle={styles.content}
       keyboardShouldPersistTaps="handled"
     >
-      {/* Header */}
-      <Text style={styles.header}>Settings</Text>
-
-      {/* Account details */}
+      {/* Profile card */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Your Account</Text>
-        <View style={styles.row}>
-          <Text style={styles.label}>Name</Text>
-          <Text style={styles.value}>{displayName}</Text>
+        <View style={styles.fieldRow}>
+          <Text style={styles.label}>Display name</Text>
+          <TextInput
+            value={displayName}
+            onChangeText={setDisplayName}
+            style={styles.input}
+            placeholder="Enter your display name"
+            editable={!savingName}
+          />
         </View>
-        <View style={styles.row}>
+        <View style={styles.fieldRow}>
           <Text style={styles.label}>Email</Text>
-          <Text style={styles.value}>{emailAddress}</Text>
+          <Text style={styles.valueText}>{emailAddress}</Text>
         </View>
+        <TouchableOpacity
+          style={[styles.primaryButton, savingName && styles.primaryButtonDisabled]}
+          onPress={handleSaveDisplayName}
+          disabled={savingName}
+        >
+          {savingName ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.primaryButtonText}>Save</Text>
+          )}
+        </TouchableOpacity>
       </View>
 
-      {/* Fridge status */}
+      {/* Current fridge summary */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Current Fridge</Text>
-        {fridgeLoading ? (
-          <View style={styles.loadingRow}>
-            <ActivityIndicator size="small" color="#2563EB" />
-            <Text style={styles.loadingText}>Loading fridge details…</Text>
-          </View>
-        ) : !profile?.currentFridgeId ? (
-          <Text style={styles.emptyText}>No fridge linked yet.</Text>
-        ) : fridge ? (
+        {currentFridge ? (
           <>
-            <View style={styles.row}>
-              <Text style={styles.label}>Name</Text>
-              <Text style={styles.value}>{fridge.name || "Unnamed fridge"}</Text>
-            </View>
-            <View style={styles.row}>
-              <Text style={styles.label}>Invite Code</Text>
-              <Text style={styles.codeBadge}>
-                {(fridge.inviteCode || "").toUpperCase() || "N/A"}
-              </Text>
-            </View>
+            <Text style={styles.valueText}>
+              {currentFridge.name || "Unnamed fridge"}
+            </Text>
+            <Text style={styles.metaText}>
+              Invite code: {(currentFridge.inviteCode || "").toUpperCase() || "N/A"}
+            </Text>
           </>
         ) : (
-          <>
-            <Text style={styles.emptyText}>We could not load this fridge.</Text>
-            {fridgeError ? (
-              <Text style={styles.errorText}>{fridgeError}</Text>
-            ) : null}
-          </>
+          <Text style={styles.placeholderText}>
+            You have not selected a current fridge yet.
+          </Text>
         )}
       </View>
 
-      {/* Join fridge form */}
+      {/* All fridges list */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Your Fridges</Text>
+        {fridgeList.length === 0 ? (
+          <Text style={styles.placeholderText}>
+            Join or create a fridge to see it here.
+          </Text>
+        ) : (
+          fridgeList.map((fridge) => {
+            const isCurrent = fridge.isCurrent;
+            const setting = settingId === fridge.id;
+            const leaving = leavingId === fridge.id;
+
+            return (
+              <View key={fridge.id} style={styles.fridgeBox}>
+                <View style={styles.fridgeHeader}>
+                  <Text style={styles.fridgeName}>
+                    {fridge.name || "Unnamed fridge"}
+                  </Text>
+                  {isCurrent ? (
+                    <Text style={styles.badge}>Current</Text>
+                  ) : null}
+                </View>
+                <Text style={styles.metaText}>
+                  Invite code: {(fridge.inviteCode || "").toUpperCase() || "N/A"}
+                </Text>
+                <Text style={styles.metaText}>
+                  Role: {(fridge.role || "member").toUpperCase()}
+                </Text>
+                <View style={styles.actionsRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.secondaryButton,
+                      (isCurrent || setting) && styles.secondaryButtonDisabled,
+                    ]}
+                    disabled={isCurrent || setting}
+                    onPress={() => handleSetCurrent(fridge)}
+                  >
+                    {setting ? (
+                      <ActivityIndicator size="small" color="#2563EB" />
+                    ) : (
+                      <Text style={styles.secondaryButtonText}>Set current</Text>
+                    )}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.destructiveButton,
+                      leaving && styles.destructiveButtonDisabled,
+                    ]}
+                    disabled={leaving}
+                    onPress={() => confirmLeaveFridge(fridge)}
+                  >
+                    {leaving ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.destructiveButtonText}>Leave</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </View>
+
+      {/* Join fridge card */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Join a Fridge</Text>
-        <Text style={styles.helpText}>
-          Enter the invite code shared by the fridge owner to link it to your
-          account.
+        <Text style={styles.metaText}>
+          Enter the invite code shared by a fridge owner to link it to your account.
         </Text>
         <TextInput
           value={inviteCode}
@@ -214,21 +292,21 @@ export default function SettingsScreen() {
           editable={!joining}
         />
         <TouchableOpacity
-          style={[styles.button, inviteDisabled && styles.buttonDisabled]}
+          style={[styles.primaryButton, inviteDisabled && styles.primaryButtonDisabled]}
           onPress={handleJoinFridge}
           disabled={inviteDisabled}
         >
           {joining ? (
             <ActivityIndicator size="small" color="#fff" />
           ) : (
-            <Text style={styles.buttonText}>Join Fridge</Text>
+            <Text style={styles.primaryButtonText}>Join</Text>
           )}
         </TouchableOpacity>
       </View>
 
-      {/* Sign-out */}
+      {/* Sign out */}
       <TouchableOpacity style={styles.signOutButton} onPress={signOut}>
-        <Text style={styles.signOutText}>Sign Out</Text>
+        <Text style={styles.signOutText}>Sign out</Text>
       </TouchableOpacity>
     </ScrollView>
   );
@@ -243,11 +321,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingVertical: 24,
   },
-  header: {
-    fontSize: 24,
-    fontWeight: "700",
-    color: "#111827",
-    marginBottom: 20,
+  centered: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F3F4F6",
   },
   card: {
     backgroundColor: "#FFFFFF",
@@ -263,53 +341,19 @@ const styles = StyleSheet.create({
     elevation: 1,
   },
   cardTitle: {
-    fontSize: 16,
+    fontSize: 18,
     fontWeight: "700",
-    color: "#1F2937",
+    color: "#111827",
     marginBottom: 12,
   },
-  row: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 10,
+  fieldRow: {
+    marginBottom: 12,
   },
   label: {
-    color: "#6B7280",
+    fontSize: 14,
     fontWeight: "600",
-  },
-  value: {
-    color: "#111827",
-    fontWeight: "600",
-  },
-  codeBadge: {
-    backgroundColor: "#EEF2FF",
-    color: "#3730A3",
-    fontWeight: "700",
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
-    letterSpacing: 1,
-  },
-  emptyText: {
     color: "#6B7280",
-    fontStyle: "italic",
-  },
-  errorText: {
-    marginTop: 8,
-    color: "#DC2626",
-  },
-  loadingRow: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  loadingText: {
-    marginLeft: 8,
-    color: "#6B7280",
-  },
-  helpText: {
-    color: "#6B7280",
-    marginBottom: 12,
+    marginBottom: 6,
   },
   input: {
     borderWidth: 1,
@@ -318,26 +362,101 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 10,
     fontSize: 16,
-    letterSpacing: 1,
+    color: "#111827",
+    backgroundColor: "#F9FAFB",
+  },
+  valueText: {
+    fontSize: 16,
+    fontWeight: "600",
     color: "#111827",
   },
-  button: {
-    marginTop: 14,
+  metaText: {
+    fontSize: 14,
+    color: "#6B7280",
+    marginTop: 4,
+  },
+  placeholderText: {
+    color: "#9CA3AF",
+    fontStyle: "italic",
+  },
+  fridgeBox: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#E5E7EB",
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    backgroundColor: "#F9FAFB",
+  },
+  fridgeHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  fridgeName: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#111827",
+  },
+  badge: {
+    backgroundColor: "#2563EB",
+    color: "#fff",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  actionsRow: {
+    flexDirection: "row",
+    marginTop: 12,
+  },
+  primaryButton: {
     backgroundColor: "#2563EB",
     paddingVertical: 14,
     borderRadius: 12,
     alignItems: "center",
   },
-  buttonDisabled: {
+  primaryButtonDisabled: {
     backgroundColor: "#93C5FD",
   },
-  buttonText: {
+  primaryButtonText: {
     color: "#FFFFFF",
     fontWeight: "700",
     fontSize: 16,
   },
+  secondaryButton: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#2563EB",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+    marginRight: 10,
+  },
+  secondaryButtonDisabled: {
+    borderColor: "#93C5FD",
+    backgroundColor: "#E0E7FF",
+  },
+  secondaryButtonText: {
+    color: "#2563EB",
+    fontWeight: "700",
+  },
+  destructiveButton: {
+    flex: 1,
+    backgroundColor: "#DC2626",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  destructiveButtonDisabled: {
+    backgroundColor: "#FCA5A5",
+  },
+  destructiveButtonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+  },
   signOutButton: {
-    backgroundColor: "#EF4444",
+    backgroundColor: "#111827",
     paddingVertical: 14,
     borderRadius: 12,
     alignItems: "center",
