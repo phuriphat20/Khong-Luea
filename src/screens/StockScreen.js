@@ -959,17 +959,50 @@ export default function StockScreen() {
               </TouchableOpacity>
             </View>
           ) : (
-            <CameraView
-              style={{ flex: 1 }}
-              facing="back"
-              barcodeScannerSettings={{
-                barcodeTypes: ["qr", "ean13", "ean8", "code128"],
-              }}
-              onBarcodeScanned={(event) => {
-                if (!event?.data) return;
-                onScan({ data: event.data });
-              }}
-            />
+            <View style={styles.scannerPreview}>
+              <CameraView
+                style={styles.camera}
+                facing="back"
+                barcodeScannerSettings={{
+                  barcodeTypes: ["qr", "ean13", "ean8", "code128"],
+                }}
+                onBarcodeScanned={(event) => {
+                  if (!event?.data) return;
+                  onScan({ data: event.data });
+                }}
+              />
+              <View style={styles.scanOverlay} pointerEvents="box-none">
+                <View style={styles.overlayHeader}>
+                  <TouchableOpacity
+                    style={styles.closeButton}
+                    onPress={() => setScanOpen(false)}
+                  >
+                    <Text style={styles.closeButtonText}>Close</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.overlayBody} pointerEvents="none">
+                  <View style={styles.overlayTop} />
+                  <View style={styles.overlayCenterRow}>
+                    <View style={styles.overlaySide} />
+                    <View style={styles.overlayFrame}>
+                      <View style={[styles.corner, styles.cornerTopLeft]} />
+                      <View style={[styles.corner, styles.cornerTopRight]} />
+                      <View style={[styles.corner, styles.cornerBottomLeft]} />
+                      <View
+                        style={[styles.corner, styles.cornerBottomRight]}
+                      />
+                    </View>
+                    <View style={styles.overlaySide} />
+                  </View>
+                  <View style={styles.overlayBottom} />
+                </View>
+                <View style={styles.overlayFooter}>
+                  <Text style={styles.scanInstruction}>
+                    Align the barcode within the frame
+                  </Text>
+                </View>
+              </View>
+            </View>
           )}
         </View>
       </Modal>
@@ -1497,6 +1530,116 @@ const styles = StyleSheet.create({
   scannerText: {
     textAlign: "center",
     color: "#1F2A5C",
+  },
+  scannerPreview: {
+    flex: 1,
+    backgroundColor: "#000",
+    position: "relative",
+  },
+  camera: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  scanOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    paddingTop: 48,
+    paddingBottom: 36,
+    paddingHorizontal: 24,
+    justifyContent: "space-between",
+  },
+  overlayHeader: {
+    alignItems: "flex-end",
+  },
+  closeButton: {
+    backgroundColor: "rgba(17, 24, 39, 0.65)",
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+  },
+  closeButtonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+  overlayBody: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    width: "100%",
+  },
+  overlayTop: {
+    width: "100%",
+    flex: 1,
+    backgroundColor: "rgba(17, 24, 39, 0.55)",
+  },
+  overlayCenterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    width: "100%",
+    maxWidth: 360,
+  },
+  overlaySide: {
+    flex: 1,
+    height: 260,
+    backgroundColor: "rgba(17, 24, 39, 0.55)",
+  },
+  overlayFrame: {
+    width: 260,
+    height: 260,
+    borderRadius: 22,
+    borderWidth: 1.5,
+    borderColor: "rgba(255, 255, 255, 0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  corner: {
+    position: "absolute",
+    width: 36,
+    height: 36,
+    borderColor: "#FFFFFF",
+  },
+  cornerTopLeft: {
+    top: -1.5,
+    left: -1.5,
+    borderTopWidth: 4,
+    borderLeftWidth: 4,
+    borderRadius: 10,
+  },
+  cornerTopRight: {
+    top: -1.5,
+    right: -1.5,
+    borderTopWidth: 4,
+    borderRightWidth: 4,
+    borderRadius: 10,
+  },
+  cornerBottomLeft: {
+    bottom: -1.5,
+    left: -1.5,
+    borderBottomWidth: 4,
+    borderLeftWidth: 4,
+    borderRadius: 10,
+  },
+  cornerBottomRight: {
+    bottom: -1.5,
+    right: -1.5,
+    borderBottomWidth: 4,
+    borderRightWidth: 4,
+    borderRadius: 10,
+  },
+  overlayBottom: {
+    width: "100%",
+    flex: 1,
+    backgroundColor: "rgba(17, 24, 39, 0.55)",
+  },
+  overlayFooter: {
+    paddingTop: 16,
+    alignItems: "center",
+  },
+  scanInstruction: {
+    color: "#F9FAFB",
+    fontWeight: "600",
+    textAlign: "center",
+    fontSize: 16,
+    letterSpacing: 0.2,
   },
   modalOverlay: {
     flex: 1,
