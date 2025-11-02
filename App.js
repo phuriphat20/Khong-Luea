@@ -10,6 +10,7 @@ import LoginScreen from './src/screens/auth/LoginScreen';
 import RegisterScreen from './src/screens/auth/RegisterScreen';
 import HomeScreen from './src/screens/HomeScreen';
 import StockScreen from './src/screens/StockScreen';
+import ShoppingScreen from './src/screens/ShoppingScreen';
 import ShoppingListScreen from './src/screens/ShoppingListScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import FridgeDetailScreen from './src/screens/FridgeDetailScreen';
@@ -51,7 +52,7 @@ function MainTabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} options={{ title: 'Home' }} />
       <Tab.Screen name="Stock" component={StockScreen} options={{ title: 'Stock' }} />
-      <Tab.Screen name="Shopping" component={ShoppingListScreen} options={{ title: 'Shopping List' }} />
+      <Tab.Screen name="Shopping" component={ShoppingScreen} options={{ title: 'Shopping List' }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ title: 'Settings' }} />
     </Tab.Navigator>
   );

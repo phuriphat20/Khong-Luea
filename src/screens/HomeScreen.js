@@ -92,6 +92,49 @@ const copyCode = async (fid) => {
           return idA.localeCompare(idB);
         });
 
+    const summariseStockSnapshot = (snap) => {
+      const now = Date.now();
+      const groups = new Map();
+      snap.forEach((docSnap) => {
+        const data = docSnap.data() || {};
+        const name = (data.name || "-").trim();
+        const unit = data.unit || "pcs";
+        const expireMs = data?.expireDate?.toMillis?.() ?? null;
+        const key = `${name.toLowerCase()}|${unit.toLowerCase()}|${expireMs ?? "none"}`;
+        const qty = Number(data.qty) || 0;
+        const lowThreshold =
+          typeof data.lowThreshold === "number"
+            ? data.lowThreshold
+            : Number(data.lowThreshold) || 0;
+        const isExpiring = !!(expireMs && expireMs - now <= THREE_DAYS);
+        if (groups.has(key)) {
+          const entry = groups.get(key);
+          entry.qty += qty;
+          entry.lowThreshold += lowThreshold;
+          entry.isExpiring = entry.isExpiring || isExpiring;
+        } else {
+          groups.set(key, {
+            qty,
+            lowThreshold,
+            isExpiring,
+          });
+        }
+      });
+      let items = 0;
+      let expSoon = 0;
+      let low = 0;
+      for (const entry of groups.values()) {
+        const isLow = entry.lowThreshold > 0 ? entry.qty <= entry.lowThreshold : entry.qty <= 0;
+        if (isLow) {
+          low += 1;
+        } else if (entry.qty > 0) {
+          items += 1;
+        }
+        if (entry.isExpiring) expSoon += 1;
+      }
+      return { items, expSoon, low };
+    };
+
     // helper: ดึงข้อมูลตู้ + นับสมาชิก + สมัครฟัง stock
     const attachFridge = async (fid) => {
       // ถ้ามีแล้ว ไม่ต้องซ้ำ
@@ -133,27 +176,15 @@ const copyCode = async (fid) => {
       const unsub = onSnapshot(
         collection(db, "fridges", fid, "stock"),
         (snap) => {
-          const now = Date.now();
-          let all = 0,
-            expSoon = 0,
-            low = 0;
-          snap.forEach((d) => {
-            const it = d.data();
-            all++;
-            const expMs = it?.expireDate?.toMillis?.();
-            if (expMs && expMs - now <= 3 * 24 * 3600 * 1000) expSoon++;
-            if (
-              typeof it.qty === "number" &&
-              typeof it.lowThreshold === "number" &&
-              it.qty <= it.lowThreshold
-            )
-              low++;
-          });
+          const stats = summariseStockSnapshot(snap);
           setFridges((prev) => {
             const idx = prev.findIndex((x) => x.id === fid);
             if (idx === -1) return prev;
             const copy = prev.slice();
-            copy[idx] = { ...copy[idx], counts: { all, expSoon, low } };
+            copy[idx] = {
+              ...copy[idx],
+              counts: { all: stats.items, expSoon: stats.expSoon, low: stats.low },
+            };
             return copy;
           });
         },

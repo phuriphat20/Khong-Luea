@@ -33,26 +33,40 @@ const formatDate = (ts) => {
 
 const THREE_DAYS = 3 * 24 * 3600 * 1000;
 const DEFAULT_UNIT = "pcs";
+const MAX_SELECTION_QTY = 9999;
 
 const aggregateFridgeItems = (docs) => {
   const map = new Map();
   docs.forEach((docItem) => {
     const normName = (docItem.name || "-").trim();
     const unit = docItem.unit || DEFAULT_UNIT;
-    const expireKey = docItem.expireDate?.toMillis?.() || "none";
+    const expireMs = docItem.expireDate?.toMillis?.() ?? null;
+    const expireKey = expireMs ?? "none";
     const key = `${normName.toLowerCase()}|${unit.toLowerCase()}|${expireKey}`;
     const lowThreshold = Number(docItem.lowThreshold) || 0;
+    const docEntry = {
+      id: docItem.id,
+      qty: docItem.qty,
+      unit,
+      lowThreshold,
+      expireMs,
+      expireDate: docItem.expireDate || null,
+      createdAt: docItem.createdAt || null,
+    };
     if (map.has(key)) {
       const group = map.get(key);
       group.qty += docItem.qty;
       group.lowThreshold += lowThreshold;
       group._isExpiring = group._isExpiring || docItem._isExpiring;
-      group.documents.push({
-        id: docItem.id,
-        qty: docItem.qty,
-        unit,
-        lowThreshold,
-      });
+      const currentExpire =
+        group.expireDate?.toMillis?.() ?? Number.POSITIVE_INFINITY;
+      if (
+        typeof expireMs === "number" &&
+        expireMs < currentExpire
+      ) {
+        group.expireDate = docItem.expireDate || null;
+      }
+      group.documents.push(docEntry);
     } else {
       map.set(key, {
         id: key,
@@ -63,14 +77,7 @@ const aggregateFridgeItems = (docs) => {
         qty: docItem.qty,
         lowThreshold,
         _isExpiring: docItem._isExpiring,
-        documents: [
-          {
-            id: docItem.id,
-            qty: docItem.qty,
-            unit,
-            lowThreshold,
-          },
-        ],
+        documents: [docEntry],
       });
     }
   });
@@ -179,6 +186,7 @@ export default function FridgeDetailScreen() {
             barcode: data.barcode || "",
             lowThreshold,
             _isExpiring: isExpiring,
+            createdAt: data.createdAt || null,
             _isLow: isLow,
           });
         });
@@ -196,28 +204,20 @@ export default function FridgeDetailScreen() {
   }, [fridgeId]);
 
   useEffect(() => {
+    const validIds = new Set(items.map((item) => item.id));
     setRemovals((prev) => {
       let changed = false;
       const next = {};
-      items.forEach((item) => {
-        const prevValue = prev[item.id];
-        if (!prevValue) return;
-        const max = Number.isFinite(item.qty) ? item.qty : 0;
-        if (max <= 0) {
+      Object.entries(prev).forEach(([id, value]) => {
+        if (!validIds.has(id)) {
           changed = true;
           return;
         }
-        const clamped = Math.min(prevValue, max);
-        if (clamped !== prevValue) changed = true;
-        if (clamped > 0) next[item.id] = clamped;
+        const clamped = Math.max(0, Math.min(MAX_SELECTION_QTY, Number(value) || 0));
+        if (clamped > 0) next[id] = clamped;
+        if (clamped !== value) changed = true;
       });
-      if (
-        !changed &&
-        Object.keys(next).length === Object.keys(prev).length &&
-        Object.keys(next).every((k) => next[k] === prev[k])
-      ) {
-        return prev;
-      }
+      if (!changed) return prev;
       return next;
     });
   }, [items]);
@@ -228,11 +228,14 @@ export default function FridgeDetailScreen() {
     }, [])
   );
 
-  const adjustRemoval = (itemId, delta, maxQty) => {
+  const adjustRemoval = (itemId, delta) => {
     setRemovals((prev) => {
-      const current = prev[itemId] || 0;
-      const next = Math.max(0, Math.min(maxQty, current + delta));
-      if (next <= 0) {
+      const current = Number(prev[itemId]) || 0;
+      let next = current + delta;
+      if (next < 0) next = 0;
+      if (next > MAX_SELECTION_QTY) next = MAX_SELECTION_QTY;
+      if (next === current) return prev;
+      if (next === 0) {
         if (prev[itemId]) {
           const { [itemId]: _omit, ...rest } = prev;
           return rest;
@@ -253,13 +256,20 @@ export default function FridgeDetailScreen() {
     let exp = 0;
     let low = 0;
     let totalQty = 0;
+    let itemCount = 0;
     items.forEach((item) => {
-      totalQty += Number.isFinite(item.qty) ? item.qty : 0;
+      const qty = Number.isFinite(item.qty) ? item.qty : 0;
+      totalQty += qty;
       if (item._isExpiring) exp += 1;
-      if (item._isLow) low += 1;
+      if (item._isLow) {
+        low += 1;
+      } else if (qty > 0) {
+        itemCount += 1;
+      }
     });
     return {
       totalQty,
+      itemCount,
       expiring: exp,
       low,
     };
@@ -267,11 +277,11 @@ export default function FridgeDetailScreen() {
 
   const statCards = useMemo(
     () => [
-      { key: "all", label: "Items", value: stats.totalQty, tone: "default" },
+      { key: "all", label: "Items", value: stats.itemCount, tone: "default" },
       { key: "exp", label: "Expiring soon", value: stats.expiring, tone: "warn" },
       { key: "low", label: "Low stock", value: stats.low, tone: "danger" },
     ],
-    [stats.totalQty, stats.expiring, stats.low]
+    [stats.itemCount, stats.expiring, stats.low]
   );
 
   const filteredItems = useMemo(() => {
@@ -300,11 +310,42 @@ export default function FridgeDetailScreen() {
     }
     setBulkLoading("remove");
     try {
+      const invalid = [];
+      selectionEntries.forEach(([groupId, amount]) => {
+        const group = itemMap.get(groupId);
+        if (!group) return;
+        const available = Number.isFinite(group.qty) ? group.qty : 0;
+        if (amount > available) {
+          invalid.push(`${group.name} (available ${available}, requested ${amount})`);
+        }
+      });
+      if (invalid.length) {
+        setBulkLoading(null);
+        Alert.alert(
+          "Not enough stock",
+          `Reduce the quantity for:\n\n${invalid.join("\n")}`
+        );
+        return;
+      }
       for (const [groupId, amount] of selectionEntries) {
         const group = itemMap.get(groupId);
         if (!group) continue;
         let remaining = Math.min(amount, group.qty);
-        for (const docEntry of group.documents) {
+        const orderedDocs = [...group.documents].sort((a, b) => {
+          const aMs = typeof a.expireMs === "number" ? a.expireMs : Number.MAX_SAFE_INTEGER;
+          const bMs = typeof b.expireMs === "number" ? b.expireMs : Number.MAX_SAFE_INTEGER;
+          if (aMs !== bMs) return aMs - bMs;
+          const aCreated =
+            typeof a.createdAt?.toMillis === "function"
+              ? a.createdAt.toMillis()
+              : Number.MAX_SAFE_INTEGER;
+          const bCreated =
+            typeof b.createdAt?.toMillis === "function"
+              ? b.createdAt.toMillis()
+              : Number.MAX_SAFE_INTEGER;
+          return aCreated - bCreated;
+        });
+        for (const docEntry of orderedDocs) {
           if (remaining <= 0) break;
           const stockRef = doc(db, "fridges", fridgeId, "stock", docEntry.id);
           const snap = await getDoc(stockRef);
@@ -316,25 +357,30 @@ export default function FridgeDetailScreen() {
           if (removeQty <= 0) continue;
           const remainingQty = Math.max(0, currentQty - removeQty);
           const batch = writeBatch(db);
-          batch.update(stockRef, {
-            qty: remainingQty,
-            updatedAt: serverTimestamp(),
-            updatedBy: user?.uid || null,
-            status: remainingQty > 0 ? data.status || "in_stock" : "empty",
-          });
+          const lowThreshold = Number(data.lowThreshold) || 0;
+          if (remainingQty <= 0) {
+            batch.delete(stockRef);
+          } else {
+            batch.update(stockRef, {
+              qty: remainingQty,
+              updatedAt: serverTimestamp(),
+              updatedBy: user?.uid || null,
+              status: remainingQty <= lowThreshold ? "low" : data.status || "in_stock",
+            });
+          }
           const historyRef = doc(
             collection(db, "fridges", fridgeId, "stockHistory")
           );
-        batch.set(historyRef, {
-          type: "remove",
-          name: data.name || group.name,
-          qty: removeQty,
-          unit: data.unit || group.unit || DEFAULT_UNIT,
-          stockId: stockRef.id,
-          byUid: user?.uid || null,
-          byName: currentUserName,
-          ts: serverTimestamp(),
-        });
+          batch.set(historyRef, {
+            type: "remove",
+            name: data.name || group.name,
+            qty: removeQty,
+            unit: data.unit || group.unit || DEFAULT_UNIT,
+            stockId: stockRef.id,
+            byUid: user?.uid || null,
+            byName: currentUserName,
+            ts: serverTimestamp(),
+          });
           await batch.commit();
           remaining -= removeQty;
         }
@@ -508,7 +554,7 @@ export default function FridgeDetailScreen() {
     const selected = removals[item.id] || 0;
     const disableMinus = bulkLoading !== null || selected <= 0;
     const disablePlus =
-      bulkLoading !== null || selected >= available || available <= 0;
+      bulkLoading !== null || selected >= MAX_SELECTION_QTY;
     const expiresOn = item.expireDate ? formatDate(item.expireDate) : null;
     const showBadges = item._isExpiring || item._isLow;
     const renderRightActions = () => (
@@ -542,7 +588,7 @@ export default function FridgeDetailScreen() {
           <TouchableOpacity
             style={[styles.counterBtn, disableMinus && styles.counterDisabled]}
             disabled={disableMinus}
-            onPress={() => adjustRemoval(item.id, -1, available)}
+            onPress={() => adjustRemoval(item.id, -1)}
           >
             <Text style={styles.counterText}>-</Text>
           </TouchableOpacity>
@@ -550,7 +596,7 @@ export default function FridgeDetailScreen() {
           <TouchableOpacity
             style={[styles.counterBtn, disablePlus && styles.counterDisabled]}
             disabled={disablePlus}
-            onPress={() => adjustRemoval(item.id, 1, available)}
+            onPress={() => adjustRemoval(item.id, 1)}
           >
             <Text style={styles.counterText}>+</Text>
           </TouchableOpacity>
