@@ -1,4 +1,4 @@
-﻿import { useContext, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -8,8 +8,9 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
-import { useNavigation, useRoute } from "@react-navigation/native";
+import { useFocusEffect, useNavigation, useRoute } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
+import { Swipeable } from "react-native-gesture-handler";
 import {
   collection,
   doc,
@@ -22,7 +23,7 @@ import AppCtx from "../context/AppContext";
 import { db } from "../services/firebaseConnected";
 
 const formatDate = (ts) => {
-  if (!ts?.toDate) return null;
+  if (!ts?.toDate) return "-";
   const date = ts.toDate();
   const day = date.getDate().toString().padStart(2, "0");
   const month = (date.getMonth() + 1).toString().padStart(2, "0");
@@ -30,10 +31,74 @@ const formatDate = (ts) => {
   return `${day}/${month}/${year}`;
 };
 
+const THREE_DAYS = 3 * 24 * 3600 * 1000;
+const DEFAULT_UNIT = "pcs";
+
+const aggregateFridgeItems = (docs) => {
+  const map = new Map();
+  docs.forEach((docItem) => {
+    const normName = (docItem.name || "-").trim();
+    const unit = docItem.unit || DEFAULT_UNIT;
+    const expireKey = docItem.expireDate?.toMillis?.() || "none";
+    const key = `${normName.toLowerCase()}|${unit.toLowerCase()}|${expireKey}`;
+    const lowThreshold = Number(docItem.lowThreshold) || 0;
+    if (map.has(key)) {
+      const group = map.get(key);
+      group.qty += docItem.qty;
+      group.lowThreshold += lowThreshold;
+      group._isExpiring = group._isExpiring || docItem._isExpiring;
+      group.documents.push({
+        id: docItem.id,
+        qty: docItem.qty,
+        unit,
+        lowThreshold,
+      });
+    } else {
+      map.set(key, {
+        id: key,
+        name: normName,
+        unit,
+        expireDate: docItem.expireDate || null,
+        barcode: docItem.barcode || "",
+        qty: docItem.qty,
+        lowThreshold,
+        _isExpiring: docItem._isExpiring,
+        documents: [
+          {
+            id: docItem.id,
+            qty: docItem.qty,
+            unit,
+            lowThreshold,
+          },
+        ],
+      });
+    }
+  });
+
+  return Array.from(map.values())
+    .map((group) => ({
+      ...group,
+      _isLow:
+        group.lowThreshold > 0 ? group.qty <= group.lowThreshold : false,
+    }))
+    .sort((a, b) => {
+      const nameCmp = a.name.localeCompare(b.name, "th");
+      if (nameCmp !== 0) return nameCmp;
+      const expireA = a.expireDate?.toMillis?.() || 0;
+      const expireB = b.expireDate?.toMillis?.() || 0;
+      return expireA - expireB;
+    });
+};
+
 export default function FridgeDetailScreen() {
   const { params } = useRoute();
   const navigation = useNavigation();
-  const { user } = useContext(AppCtx);
+  const { user, profile } = useContext(AppCtx);
+  const currentUserName =
+    profile?.displayName?.trim() ||
+    user?.displayName?.trim() ||
+    user?.email ||
+    (user?.uid ? `Member ${user.uid.slice(-4).toUpperCase()}` : "Unknown member");
 
   const fridgeId = params?.fridgeId;
 
@@ -41,7 +106,8 @@ export default function FridgeDetailScreen() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [removals, setRemovals] = useState({});
-  const [processingId, setProcessingId] = useState(null);
+  const [activeFilter, setActiveFilter] = useState("all"); // all | exp | low
+  const [bulkLoading, setBulkLoading] = useState(null); // null | "remove" | "shopping"
 
   useEffect(() => {
     if (!fridgeId) {
@@ -81,31 +147,43 @@ export default function FridgeDetailScreen() {
   }, [fridgeId, navigation]);
 
   useEffect(() => {
+    setActiveFilter("all");
+  }, [fridgeId]);
+
+  useEffect(() => {
     if (!fridgeId) return;
     setLoading(true);
     const stockRef = collection(db, "fridges", fridgeId, "stock");
     const unsubscribe = onSnapshot(
       stockRef,
       (snap) => {
+        const now = Date.now();
         const next = [];
         snap.forEach((docSnap) => {
-          const data = docSnap.data();
+          const data = docSnap.data() || {};
+          const qty =
+            typeof data.qty === "number" ? data.qty : Number(data.qty) || 0;
+          const lowThreshold =
+            typeof data.lowThreshold === "number"
+              ? data.lowThreshold
+              : Number(data.lowThreshold) || 0;
+          const expireMs = data?.expireDate?.toMillis?.();
+          const isExpiring = !!(expireMs && expireMs - now <= THREE_DAYS);
+          const isLow = lowThreshold > 0 && qty <= lowThreshold;
           next.push({
             id: docSnap.id,
             name: data.name || "-",
-            qty: typeof data.qty === "number" ? data.qty : Number(data.qty) || 0,
-            unit: data.unit || "",
+            qty,
+            unit: data.unit || DEFAULT_UNIT,
             expireDate: data.expireDate || null,
             barcode: data.barcode || "",
+            lowThreshold,
+            _isExpiring: isExpiring,
+            _isLow: isLow,
           });
         });
-        next.sort((a, b) => {
-          const nameA = a.name?.toString().toLowerCase() || "";
-          const nameB = b.name?.toString().toLowerCase() || "";
-          if (nameA === nameB) return 0;
-          return nameA < nameB ? -1 : 1;
-        });
-        setItems(next);
+        const grouped = aggregateFridgeItems(next);
+        setItems(grouped);
         setLoading(false);
       },
       (err) => {
@@ -133,12 +211,22 @@ export default function FridgeDetailScreen() {
         if (clamped !== prevValue) changed = true;
         if (clamped > 0) next[item.id] = clamped;
       });
-      if (!changed && Object.keys(prev).length === Object.keys(next).length) {
+      if (
+        !changed &&
+        Object.keys(next).length === Object.keys(prev).length &&
+        Object.keys(next).every((k) => next[k] === prev[k])
+      ) {
         return prev;
       }
       return next;
     });
   }, [items]);
+
+  useFocusEffect(
+    useCallback(() => {
+      return () => setRemovals({});
+    }, [])
+  );
 
   const adjustRemoval = (itemId, delta, maxQty) => {
     setRemovals((prev) => {
@@ -155,110 +243,215 @@ export default function FridgeDetailScreen() {
     });
   };
 
-  const handleRemove = async (item) => {
-    const amount = removals[item.id] || 0;
-    if (amount <= 0) {
-      Alert.alert("Choose quantity", "Set how many items to remove before confirming.");
+  const itemMap = useMemo(() => {
+    const map = new Map();
+    items.forEach((item) => map.set(item.id, item));
+    return map;
+  }, [items]);
+
+  const stats = useMemo(() => {
+    let exp = 0;
+    let low = 0;
+    let totalQty = 0;
+    items.forEach((item) => {
+      totalQty += Number.isFinite(item.qty) ? item.qty : 0;
+      if (item._isExpiring) exp += 1;
+      if (item._isLow) low += 1;
+    });
+    return {
+      totalQty,
+      expiring: exp,
+      low,
+    };
+  }, [items]);
+
+  const statCards = useMemo(
+    () => [
+      { key: "all", label: "Items", value: stats.totalQty, tone: "default" },
+      { key: "exp", label: "Expiring soon", value: stats.expiring, tone: "warn" },
+      { key: "low", label: "Low stock", value: stats.low, tone: "danger" },
+    ],
+    [stats.totalQty, stats.expiring, stats.low]
+  );
+
+  const filteredItems = useMemo(() => {
+    if (activeFilter === "exp") return items.filter((item) => item._isExpiring);
+    if (activeFilter === "low") return items.filter((item) => item._isLow);
+    return items;
+  }, [items, activeFilter]);
+
+  const selectionEntries = useMemo(
+    () =>
+      Object.entries(removals).filter(
+        ([id, qty]) => qty > 0 && itemMap.has(id)
+      ),
+    [removals, itemMap]
+  );
+
+  const totalSelected = useMemo(
+    () => selectionEntries.reduce((sum, [, qty]) => sum + qty, 0),
+    [selectionEntries]
+  );
+
+  const handleBulkRemove = async () => {
+    if (!selectionEntries.length || !fridgeId) {
+      Alert.alert("Nothing selected", "Choose items before removing them.");
       return;
     }
-    if (!fridgeId) return;
-    setProcessingId(item.id);
+    setBulkLoading("remove");
     try {
-      const stockRef = doc(db, "fridges", fridgeId, "stock", item.id);
-      const snap = await getDoc(stockRef);
-      if (!snap.exists()) {
-        Alert.alert("Item not found", "This entry was removed already.");
-        return;
+      for (const [groupId, amount] of selectionEntries) {
+        const group = itemMap.get(groupId);
+        if (!group) continue;
+        let remaining = Math.min(amount, group.qty);
+        for (const docEntry of group.documents) {
+          if (remaining <= 0) break;
+          const stockRef = doc(db, "fridges", fridgeId, "stock", docEntry.id);
+          const snap = await getDoc(stockRef);
+          if (!snap.exists()) continue;
+          const data = snap.data() || {};
+          const currentQty = Number(data.qty) || 0;
+          if (currentQty <= 0) continue;
+          const removeQty = Math.min(remaining, currentQty);
+          if (removeQty <= 0) continue;
+          const remainingQty = Math.max(0, currentQty - removeQty);
+          const batch = writeBatch(db);
+          batch.update(stockRef, {
+            qty: remainingQty,
+            updatedAt: serverTimestamp(),
+            updatedBy: user?.uid || null,
+            status: remainingQty > 0 ? data.status || "in_stock" : "empty",
+          });
+          const historyRef = doc(
+            collection(db, "fridges", fridgeId, "stockHistory")
+          );
+        batch.set(historyRef, {
+          type: "remove",
+          name: data.name || group.name,
+          qty: removeQty,
+          unit: data.unit || group.unit || DEFAULT_UNIT,
+          stockId: stockRef.id,
+          byUid: user?.uid || null,
+          byName: currentUserName,
+          ts: serverTimestamp(),
+        });
+          await batch.commit();
+          remaining -= removeQty;
+        }
       }
-      const data = snap.data();
-      const currentQty = Number(data.qty) || 0;
-      if (currentQty <= 0) {
-        Alert.alert("Nothing left", "The quantity is already zero.");
-        return;
-      }
-      const actualAmount = Math.min(amount, currentQty);
-      const batch = writeBatch(db);
-      batch.update(stockRef, {
-        qty: Math.max(0, currentQty - actualAmount),
-        updatedAt: serverTimestamp(),
-      });
-      const historyRef = doc(collection(db, "fridges", fridgeId, "stockHistory"));
-      batch.set(historyRef, {
-        type: "remove",
-        name: data.name || item.name,
-        qty: actualAmount,
-        unit: data.unit || item.unit || "",
-        stockId: stockRef.id,
-        byUid: user?.uid || null,
-        ts: serverTimestamp(),
-      });
-      await batch.commit();
-      setRemovals((prev) => {
-        const { [item.id]: _omit, ...rest } = prev;
-        return rest;
-      });
+      setRemovals({});
+      Alert.alert("Inventory updated", "Selected items were removed from the fridge.");
     } catch (err) {
-      console.warn("remove stock failed", err);
+      console.warn("bulk remove failed", err);
       Alert.alert("Could not remove items", err.message || "Something went wrong");
     } finally {
-      setProcessingId(null);
+      setBulkLoading(null);
     }
   };
 
-  const renderItem = ({ item }) => {
-    const available = Number.isFinite(item.qty) ? item.qty : 0;
-    const value = removals[item.id] || 0;
-    const disableMinus = processingId === item.id || value <= 0;
-    const disablePlus = processingId === item.id || value >= available;
-    const expiresOn = formatDate(item.expireDate);
+  const handleAddToShopping = async () => {
+    if (!selectionEntries.length || !fridgeId) {
+      Alert.alert("Nothing selected", "Choose items before adding to the shopping list.");
+      return;
+    }
+    setBulkLoading("shopping");
+    try {
+      const batch = writeBatch(db);
+      let hasWrite = false;
+      selectionEntries.forEach(([itemId, qty]) => {
+        const item = itemMap.get(itemId);
+        if (!item || qty <= 0) return;
+        const ref = doc(collection(db, "fridges", fridgeId, "shopping"));
+        const stockDocId = item.documents?.[0]?.id || itemId;
+        batch.set(ref, {
+          name: item.name,
+          qty,
+          unit: item.unit || DEFAULT_UNIT,
+          status: "pending",
+          createdAt: serverTimestamp(),
+          source: "fridge",
+          fromStockId: stockDocId,
+          expireDate: item.expireDate || null,
+          byUid: user?.uid || null,
+          fridgeId,
+        });
+        hasWrite = true;
+      });
+      if (!hasWrite) {
+        setBulkLoading(null);
+        Alert.alert("Nothing selected", "Choose items before adding to the shopping list.");
+        return;
+      }
+      await batch.commit();
+      setRemovals({});
+      Alert.alert(
+        "Added to shopping list",
+        "Selected items were added. Quantities in the fridge were not changed."
+      );
+    } catch (err) {
+      console.warn("add to shopping failed", err);
+      Alert.alert("Could not add items", err.message || "Something went wrong");
+    } finally {
+      setBulkLoading(null);
+    }
+  };
 
-    return (
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.itemName}>{item.name}</Text>
-          <Text style={styles.itemQty}>
-            {available} {item.unit}
-          </Text>
-        </View>
+  const handleDeleteGroup = async (group) => {
+    if (!fridgeId) return;
+    setBulkLoading("remove");
+    try {
+      let removedAny = false;
+      for (const docEntry of group.documents) {
+        const stockRef = doc(db, "fridges", fridgeId, "stock", docEntry.id);
+        const snap = await getDoc(stockRef);
+        if (!snap.exists()) continue;
+        const data = snap.data() || {};
+        const currentQty = Number(data.qty) || 0;
+        const batch = writeBatch(db);
+        batch.delete(stockRef);
+        const historyRef = doc(
+          collection(db, "fridges", fridgeId, "stockHistory")
+        );
+        batch.set(historyRef, {
+          type: "remove",
+          name: data.name || group.name,
+          qty: currentQty,
+          unit: data.unit || group.unit || DEFAULT_UNIT,
+          stockId: stockRef.id,
+          byUid: user?.uid || null,
+          byName: currentUserName,
+          ts: serverTimestamp(),
+        });
+        await batch.commit();
+        removedAny = true;
+      }
+      setRemovals((prev) => {
+        const { [group.id]: _omit, ...rest } = prev;
+        return rest;
+      });
+      if (removedAny) {
+        Alert.alert("Removed", `"${group.name}" has been removed from this fridge.`);
+      }
+    } catch (err) {
+      console.warn("delete group failed", err);
+      Alert.alert("Could not remove item", err.message || "Something went wrong");
+    } finally {
+      setBulkLoading(null);
+    }
+  };
 
-        {expiresOn && <Text style={styles.itemMeta}>Expires on: {expiresOn}</Text>}
-        {item.barcode ? <Text style={styles.itemMeta}>Barcode: {item.barcode}</Text> : null}
-
-        <View style={styles.selectorRow}>
-          <TouchableOpacity
-            style={[styles.counterBtn, disableMinus && styles.counterBtnDisabled]}
-            disabled={disableMinus}
-            onPress={() => adjustRemoval(item.id, -1, available)}
-          >
-            <Text style={styles.counterText}>-</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.counterValue}>{value}</Text>
-
-          <TouchableOpacity
-            style={[styles.counterBtn, disablePlus && styles.counterBtnDisabled]}
-            disabled={disablePlus}
-            onPress={() => adjustRemoval(item.id, 1, available)}
-          >
-            <Text style={styles.counterText}>+</Text>
-          </TouchableOpacity>
-        </View>
-
-        <TouchableOpacity
-          style={[
-            styles.removeBtn,
-            (value <= 0 || processingId === item.id) && styles.removeBtnDisabled,
-          ]}
-          disabled={value <= 0 || processingId === item.id}
-          onPress={() => handleRemove(item)}
-        >
-          {processingId === item.id ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.removeText}>Confirm removal</Text>
-          )}
-        </TouchableOpacity>
-      </View>
+  const confirmDeleteGroup = (group) => {
+    Alert.alert(
+      "Remove from fridge",
+      `Remove all "${group.name}" entries from this fridge?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => handleDeleteGroup(group),
+        },
+      ]
     );
   };
 
@@ -266,16 +459,124 @@ export default function FridgeDetailScreen() {
     if (!fridge) return null;
     return (
       <View style={styles.header}>
-        <View style={styles.headerIcon}>
-          <Ionicons name="cube-outline" size={24} color="#2D5BFF" />
+        <View style={styles.headerTop}>
+          <View style={styles.headerIcon}>
+            <Ionicons name="cube-outline" size={24} color="#2D5BFF" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.headerTitle}>{fridge.name || "My fridge"}</Text>
+            <Text style={styles.headerSub}>
+              {stats.totalQty} item{stats.totalQty === 1 ? "" : "s"} in this fridge
+            </Text>
+          </View>
         </View>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.headerTitle}>{fridge.name || "My fridge"}</Text>
-          <Text style={styles.headerSub}>{items.length} items in this fridge</Text>
+        <View style={styles.statRow}>
+          {statCards.map((card) => {
+            const isActive = activeFilter === card.key;
+            const valueStyle =
+              card.tone === "warn"
+                ? styles.statValueWarn
+                : card.tone === "danger"
+                ? styles.statValueDanger
+                : styles.statValue;
+            return (
+              <TouchableOpacity
+                key={card.key}
+                style={[
+                  styles.statCard,
+                  isActive && styles.statCardActive,
+                ]}
+                onPress={() =>
+                  setActiveFilter((prev) =>
+                    prev === card.key ? "all" : card.key
+                  )
+                }
+                activeOpacity={0.85}
+              >
+                <Text style={valueStyle}>{card.value}</Text>
+                <Text style={styles.statLabel}>{card.label}</Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
       </View>
     );
-  }, [fridge, items.length]);
+  }, [fridge, stats.totalQty, statCards, activeFilter]);
+
+  const renderItem = ({ item }) => {
+    const available = Number.isFinite(item.qty) ? item.qty : 0;
+    const selected = removals[item.id] || 0;
+    const disableMinus = bulkLoading !== null || selected <= 0;
+    const disablePlus =
+      bulkLoading !== null || selected >= available || available <= 0;
+    const expiresOn = item.expireDate ? formatDate(item.expireDate) : null;
+    const showBadges = item._isExpiring || item._isLow;
+    const renderRightActions = () => (
+      <TouchableOpacity
+        style={styles.deleteAction}
+        activeOpacity={0.85}
+        onPress={() => confirmDeleteGroup(item)}
+      >
+        <Ionicons name="trash-outline" size={22} color="#fff" />
+        <Text style={styles.deleteActionText}>Remove</Text>
+      </TouchableOpacity>
+    );
+
+    return (
+      <Swipeable
+        renderRightActions={renderRightActions}
+        overshootRight={false}
+        friction={2}
+      >
+        <View style={styles.card}>
+        <View style={styles.cardContent}>
+          <Text style={styles.itemName}>{item.name}</Text>
+          <Text style={styles.itemQty}>
+            {available} {item.unit}
+          </Text>
+          {expiresOn && (
+            <Text style={styles.itemMeta}>Expires on: {expiresOn}</Text>
+          )}
+        </View>
+        <View style={styles.counterRow}>
+          <TouchableOpacity
+            style={[styles.counterBtn, disableMinus && styles.counterDisabled]}
+            disabled={disableMinus}
+            onPress={() => adjustRemoval(item.id, -1, available)}
+          >
+            <Text style={styles.counterText}>-</Text>
+          </TouchableOpacity>
+          <Text style={styles.counterValue}>{selected}</Text>
+          <TouchableOpacity
+            style={[styles.counterBtn, disablePlus && styles.counterDisabled]}
+            disabled={disablePlus}
+            onPress={() => adjustRemoval(item.id, 1, available)}
+          >
+            <Text style={styles.counterText}>+</Text>
+          </TouchableOpacity>
+        </View>
+        {showBadges && (
+          <View style={styles.badgeRow}>
+            {item._isExpiring && (
+              <View style={[styles.badge, styles.badgeWarn]}>
+                <Text style={[styles.badgeText, styles.badgeTextWarn]}>
+                  Expiring soon
+                </Text>
+              </View>
+            )}
+            {item._isLow && (
+              <View style={[styles.badge, styles.badgeDanger]}>
+                <Text style={[styles.badgeText, styles.badgeTextDanger]}>
+                  Low stock
+                </Text>
+              </View>
+            )}
+          </View>
+        )}
+        </View>
+      </Swipeable>
+    );
+  };
 
   if (loading) {
     return (
@@ -293,23 +594,81 @@ export default function FridgeDetailScreen() {
     );
   }
 
+  const bottomPadding = totalSelected > 0 ? 200 : 120;
+  const emptyMessage =
+    items.length === 0 ? "No items in this fridge yet" : "Nothing in this filter";
+  const emptyHint =
+    items.length === 0
+      ? "Add products from the Stock tab to start tracking inventory."
+      : "Switch filters or adjust your selection to keep browsing.";
+
   return (
     <View style={styles.container}>
       <FlatList
-        data={items}
+        data={filteredItems}
         keyExtractor={(item) => item.id}
         renderItem={renderItem}
-        contentContainerStyle={
-          items.length === 0 ? styles.emptyContent : { paddingBottom: 16 }
-        }
         ListHeaderComponent={listHeader}
+        contentContainerStyle={
+          filteredItems.length === 0
+            ? [styles.emptyContent, { paddingBottom: bottomPadding }]
+            : { paddingBottom: bottomPadding }
+        }
         ListEmptyComponent={
           <View style={styles.emptyBox}>
-            <Text style={styles.emptyTitle}>No items yet</Text>
-            <Text style={styles.emptySub}>Add products from the Stock tab to see them here.</Text>
+            <Text style={styles.emptyTitle}>{emptyMessage}</Text>
+            <Text style={styles.emptySub}>{emptyHint}</Text>
           </View>
         }
       />
+
+      {totalSelected > 0 && (
+        <View style={styles.summaryBar}>
+          <View style={styles.summaryInfo}>
+            <Text style={styles.summaryTitle}>
+              {totalSelected} item{totalSelected === 1 ? "" : "s"} selected
+            </Text>
+            <Text style={styles.summaryMeta}>
+              Across {selectionEntries.length} product
+              {selectionEntries.length === 1 ? "" : "s"}
+            </Text>
+          </View>
+          <View style={styles.summaryActions}>
+            <TouchableOpacity
+              style={[
+                styles.summaryButton,
+                styles.summaryButtonGhost,
+                bulkLoading && styles.summaryButtonDisabled,
+              ]}
+              onPress={handleAddToShopping}
+              disabled={bulkLoading !== null}
+              activeOpacity={0.85}
+            >
+              {bulkLoading === "shopping" ? (
+                <ActivityIndicator color="#2D5BFF" />
+              ) : (
+                <Text style={styles.summaryGhostText}>Add to shopping list</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.summaryButton,
+                styles.summaryButtonPrimary,
+                bulkLoading && styles.summaryButtonDisabled,
+              ]}
+              onPress={handleBulkRemove}
+              disabled={bulkLoading !== null}
+              activeOpacity={0.85}
+            >
+              {bulkLoading === "remove" ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.summaryPrimaryText}>Remove from fridge</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -325,13 +684,17 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   header: {
-    flexDirection: "row",
-    alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 20,
-    backgroundColor: "#fff",
+    paddingTop: 24,
+    paddingBottom: 12,
+    backgroundColor: "#FFFFFF",
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#E3E8F5",
+  },
+  headerTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 16,
   },
   headerIcon: {
     width: 44,
@@ -343,19 +706,55 @@ const styles = StyleSheet.create({
     marginRight: 12,
   },
   headerTitle: {
-    fontSize: 18,
-    fontWeight: "700",
+    fontSize: 20,
+    fontWeight: "800",
     color: "#1F2A5C",
   },
   headerSub: {
     color: "#6B7280",
+    marginTop: 6,
+  },
+  statRow: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  statCard: {
+    flex: 1,
+    paddingVertical: 14,
+    backgroundColor: "#F4F6FB",
+    borderRadius: 14,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "transparent",
+  },
+  statCardActive: {
+    backgroundColor: "#EEF4FF",
+    borderColor: "#2D5BFF",
+  },
+  statValue: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: "#1F2A5C",
+  },
+  statValueWarn: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: "#D97706",
+  },
+  statValueDanger: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: "#DC2626",
+  },
+  statLabel: {
     marginTop: 4,
+    color: "#6B7280",
   },
   card: {
     marginHorizontal: 16,
     marginTop: 16,
-    backgroundColor: "#fff",
-    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
     padding: 16,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 6 },
@@ -363,43 +762,39 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 2,
   },
-  cardHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
+  cardContent: {
+    marginBottom: 12,
   },
   itemName: {
     fontSize: 16,
     fontWeight: "700",
     color: "#1F2A5C",
-    flex: 1,
-    marginRight: 12,
   },
   itemQty: {
+    marginTop: 4,
     fontWeight: "600",
     color: "#3563E9",
   },
   itemMeta: {
     color: "#6B7280",
-    marginTop: 6,
+    marginTop: 4,
     fontSize: 13,
   },
-  selectorRow: {
+  counterRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    marginTop: 14,
-    gap: 16,
+    justifyContent: "flex-end",
+    gap: 12,
   },
   counterBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: "#EEF3FF",
     alignItems: "center",
     justifyContent: "center",
   },
-  counterBtnDisabled: {
+  counterDisabled: {
     opacity: 0.3,
   },
   counterText: {
@@ -409,33 +804,66 @@ const styles = StyleSheet.create({
   },
   counterValue: {
     minWidth: 32,
-    textAlign: "center",
     fontSize: 18,
     fontWeight: "700",
     color: "#1F2A5C",
+    textAlign: "center",
   },
-  removeBtn: {
-    marginTop: 16,
-    backgroundColor: "#2D5BFF",
-    paddingVertical: 12,
-    borderRadius: 12,
+  badgeRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 12,
+    flexWrap: "wrap",
+  },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  badgeWarn: {
+    backgroundColor: "#FFF7E6",
+  },
+  badgeDanger: {
+    backgroundColor: "#FFEAEA",
+  },
+  badgeText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  badgeTextWarn: {
+    color: "#B45309",
+  },
+  badgeTextDanger: {
+    color: "#B91C1C",
+  },
+  deleteAction: {
+    backgroundColor: "#DC2626",
+    justifyContent: "center",
     alignItems: "center",
+    width: 96,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 18,
+    marginTop: 16,
+    marginBottom: 0,
   },
-  removeBtnDisabled: {
-    backgroundColor: "#C6D4FF",
-  },
-  removeText: {
-    color: "#fff",
+  deleteActionText: {
+    color: "#FFFFFF",
     fontWeight: "700",
+    marginTop: 4,
   },
   emptyContent: {
-    flexGrow: 1,
-    justifyContent: "center",
-    paddingHorizontal: 32,
+    paddingTop: 24,
+    paddingHorizontal: 24,
   },
   emptyBox: {
-    alignItems: "center",
-    paddingHorizontal: 16,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    paddingHorizontal: 20,
+    paddingVertical: 24,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    marginHorizontal: 16,
+    marginTop: 12,
   },
   emptyTitle: {
     fontSize: 16,
@@ -446,5 +874,63 @@ const styles = StyleSheet.create({
     color: "#6B7280",
     marginTop: 6,
     textAlign: "center",
+  },
+  summaryBar: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 16,
+    paddingVertical: 20,
+    backgroundColor: "#FFFFFF",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#E5E7EB",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -6 },
+    shadowOpacity: 0.08,
+    shadowRadius: 16,
+    elevation: 12,
+  },
+  summaryInfo: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-end",
+    marginBottom: 16,
+  },
+  summaryTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1F2A5C",
+  },
+  summaryMeta: {
+    color: "#6B7280",
+  },
+  summaryActions: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  summaryButton: {
+    flex: 1,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  summaryButtonPrimary: {
+    backgroundColor: "#2D5BFF",
+  },
+  summaryButtonGhost: {
+    backgroundColor: "#EEF4FF",
+  },
+  summaryButtonDisabled: {
+    opacity: 0.7,
+  },
+  summaryPrimaryText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+  },
+  summaryGhostText: {
+    color: "#2D5BFF",
+    fontWeight: "700",
   },
 });

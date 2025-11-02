@@ -9,21 +9,22 @@ import {
   Alert,
   Modal,
   ActivityIndicator,
+  Platform,
+  ScrollView,
 } from "react-native";
-import { useRoute } from "@react-navigation/native";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import DateTimePicker, {
+  DateTimePickerAndroid,
+} from "@react-native-community/datetimepicker";
 import {
   collection,
-  collectionGroup,
   doc,
   getDoc,
-  getDocs,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   Timestamp,
-  where,
   writeBatch,
 } from "firebase/firestore";
 import AppCtx from "../context/AppContext";
@@ -31,6 +32,39 @@ import { db } from "../services/firebaseConnected";
 
 const THREE_DAYS = 3 * 24 * 3600 * 1000;
 const DEFAULT_UNIT = "pcs";
+const OTHER_UNIT_VALUE = "__other__";
+const UNIT_OPTIONS = [
+  "pcs",
+  "pack",
+  "bottle",
+  "bag",
+  "box",
+  "can",
+  "kg",
+  "g",
+  "l",
+  "ml",
+  OTHER_UNIT_VALUE,
+];
+
+const formatInputDate = (date) => {
+  if (!date || !(date instanceof Date) || Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const parseInputDate = (value) => {
+  if (!value) return null;
+  const [y, m, d] = value.split("-").map((part) => Number(part));
+  if (!y || !m || !d) return null;
+  const parsed = new Date(y, m - 1, d);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
 
 const formatDate = (ts) => {
   if (!ts?.toDate) return "-";
@@ -49,12 +83,57 @@ const formatDateTime = (ts) => {
   });
 };
 
-export default function StockScreen() {
-  const { user } = useContext(AppCtx);
-  const route = useRoute();
-  const fridgeIdFromHome = route?.params?.fridgeId ?? null;
-  const initialFilter = fridgeIdFromHome ? "all" : "none";
+const aggregateStockItems = (items) => {
+  const map = new Map();
+  items.forEach((item) => {
+    const normName = (item.name || "").trim();
+    const unit = item.unit || DEFAULT_UNIT;
+    const expireKey = item.expireDate?.toMillis?.() || "none";
+    const key = `${item.fridgeId}|${normName.toLowerCase()}|${unit.toLowerCase()}|${expireKey}`;
+    const lowThreshold = Number(item.lowThreshold) || 0;
+    if (map.has(key)) {
+      const entry = map.get(key);
+      entry.qty += item.qty;
+      entry.lowThreshold += lowThreshold;
+      entry._isExpiring = entry._isExpiring || item._isExpiring;
+      entry._isLow =
+        entry.lowThreshold > 0 ? entry.qty <= entry.lowThreshold : false;
+      entry.ids.push(item.id);
+    } else {
+      const expireDate = item.expireDate || null;
+      const isLow =
+        lowThreshold > 0 ? item.qty <= lowThreshold : item._isLow || false;
+      map.set(key, {
+        ...item,
+        id: key,
+        name: normName,
+        unit,
+        expireDate,
+        qty: item.qty,
+        lowThreshold,
+        _isExpiring: item._isExpiring,
+        _isLow: isLow,
+        ids: [item.id],
+      });
+    }
+  });
+  return Array.from(map.values()).sort((a, b) => {
+    const nameCmp = a.name.localeCompare(b.name, "th");
+    if (nameCmp !== 0) return nameCmp;
+    const expireA = a.expireDate?.toMillis?.() || 0;
+    const expireB = b.expireDate?.toMillis?.() || 0;
+    return expireA - expireB;
+  });
+};
 
+export default function StockScreen() {
+  const { user, profile } = useContext(AppCtx);
+  const currentUserName =
+    profile?.displayName?.trim() ||
+    user?.displayName?.trim() ||
+    user?.email ||
+    (user?.uid ? `Member ${user.uid.slice(-4).toUpperCase()}` : "Unknown member");
+  const initialFilter = "none";
   const [memberFridgeIds, setMemberFridgeIds] = useState([]);
   const [fridgeMeta, setFridgeMeta] = useState({});
   const [stock, setStock] = useState([]);
@@ -62,10 +141,6 @@ export default function StockScreen() {
   const [activeFilter, setActiveFilter] = useState(initialFilter); // none | all | exp | low
   const [loadingStock, setLoadingStock] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(true);
-
-  const [removalDraft, setRemovalDraft] = useState({});
-  const [processingId, setProcessingId] = useState(null);
-
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({
     name: "",
@@ -73,32 +148,76 @@ export default function StockScreen() {
     unit: DEFAULT_UNIT,
     expireDate: "",
     barcode: "",
+    fridgeId: "",
   });
+  const [unitModalOpen, setUnitModalOpen] = useState(false);
+  const [fridgeModalOpen, setFridgeModalOpen] = useState(false);
+  const [iosDatePickerVisible, setIosDatePickerVisible] = useState(false);
+  const [iosDateValue, setIosDateValue] = useState(new Date());
+  const [customUnitModalOpen, setCustomUnitModalOpen] = useState(false);
+  const [customUnitDraft, setCustomUnitDraft] = useState("");
+  const [userNameCache, setUserNameCache] = useState({});
+
+  useEffect(() => {
+    if (user?.uid && currentUserName) {
+      setUserNameCache((prev) => {
+        if (prev[user.uid]) return prev;
+        return { ...prev, [user.uid]: currentUserName };
+      });
+    }
+  }, [user?.uid, currentUserName]);
 
   const [scanOpen, setScanOpen] = useState(false);
   const [hasPermission, setHasPermission] = useState(null);
   const [permission, requestPermission] = useCameraPermissions();
   const scanningLockRef = useRef(false);
 
-  const modeFridgeId = fridgeIdFromHome || null;
-  const isSingleFridge = !!modeFridgeId;
+  useEffect(() => {
+    if (!showAdd) return;
+    setForm((prev) => {
+      if (
+        prev.fridgeId &&
+        memberFridgeIds.includes(prev.fridgeId)
+      ) {
+        return prev;
+      }
+      if (!memberFridgeIds.length) return prev;
+      return { ...prev, fridgeId: memberFridgeIds[0] };
+    });
+  }, [showAdd, memberFridgeIds]);
 
   useEffect(() => {
-    if (!user?.uid) return;
-    let mounted = true;
-    (async () => {
-      const mSnap = await getDocs(
-        query(collectionGroup(db, "members"), where("uid", "==", user.uid))
-      );
-      if (!mounted) return;
-      const ids = [
-        ...new Set(mSnap.docs.map((d) => d.ref.parent.parent.id)),
-      ];
-      setMemberFridgeIds(ids);
-    })();
-    return () => {
-      mounted = false;
-    };
+    if (showAdd) return;
+    setUnitModalOpen(false);
+    setFridgeModalOpen(false);
+    setCustomUnitModalOpen(false);
+    if (Platform.OS === "ios") setIosDatePickerVisible(false);
+    setCustomUnitDraft("");
+  }, [showAdd]);
+
+  useEffect(() => {
+    if (!user?.uid) {
+      setMemberFridgeIds([]);
+      return;
+    }
+    const membershipsRef = collection(db, "users", user.uid, "memberships");
+    const unsubscribe = onSnapshot(
+      membershipsRef,
+      (snap) => {
+        const ids = [];
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() || {};
+          const fid = data.fridgeId || docSnap.id;
+          if (fid) ids.push(fid);
+        });
+        setMemberFridgeIds(Array.from(new Set(ids)));
+      },
+      (err) => {
+        console.warn("Stock memberships error:", err);
+        setMemberFridgeIds([]);
+      }
+    );
+    return () => unsubscribe();
   }, [user?.uid]);
 
   const memberKey = useMemo(
@@ -106,20 +225,12 @@ export default function StockScreen() {
     [memberFridgeIds]
   );
 
-  const targetFridges = useMemo(() => {
-    const set = new Set(memberFridgeIds);
-    if (modeFridgeId) set.add(modeFridgeId);
-    return Array.from(set);
-  }, [memberKey, modeFridgeId]);
-
-  useEffect(() => {
-    setActiveFilter(fridgeIdFromHome ? "all" : "none");
-  }, [fridgeIdFromHome]);
-
-  const stockFridges = useMemo(
-    () => (modeFridgeId ? [modeFridgeId] : targetFridges),
-    [modeFridgeId, targetFridges]
+  const targetFridges = useMemo(
+    () => Array.from(new Set(memberFridgeIds)),
+    [memberKey]
   );
+
+  const stockFridges = useMemo(() => targetFridges, [targetFridges]);
   const stockFridgeKey = useMemo(
     () => stockFridges.slice().sort().join("|"),
     [stockFridges]
@@ -128,6 +239,26 @@ export default function StockScreen() {
     () => targetFridges.slice().sort().join("|"),
     [targetFridges]
   );
+  const fridgeOptions = useMemo(
+    () =>
+      targetFridges.map((fid) => ({
+        id: fid,
+        name:
+          fridgeMeta[fid]?.name ||
+          `Fridge ${fid.slice(-4).toUpperCase()}`,
+      })),
+    [targetFridges, fridgeMeta]
+  );
+  const fridgeCount = fridgeOptions.length;
+  const selectedFridgeId = form.fridgeId || "";
+  const selectedFridgeMeta = selectedFridgeId
+    ? fridgeMeta[selectedFridgeId] || null
+    : null;
+  const selectedFridgeLabel = selectedFridgeMeta?.name
+    ? selectedFridgeMeta.name
+    : selectedFridgeId
+    ? `Fridge ${selectedFridgeId.slice(-4).toUpperCase()}`
+    : "Select fridge";
 
   useEffect(() => {
     if (!targetFridges.length) {
@@ -196,15 +327,6 @@ export default function StockScreen() {
       return item;
     };
 
-    const sortStock = (list) =>
-      list.slice().sort((a, b) => {
-        const aName = (a.name || "").toString();
-        const bName = (b.name || "").toString();
-        const cmp = aName.localeCompare(bName, "th");
-        if (cmp !== 0) return cmp;
-        return (b.qty || 0) - (a.qty || 0);
-      });
-
     stockFridges.forEach((fid) => {
       const unsub = onSnapshot(
         collection(db, "fridges", fid, "stock"),
@@ -213,7 +335,8 @@ export default function StockScreen() {
           snap.forEach((docSnap) => items.push(parseDoc(fid, docSnap)));
           cache.set(fid, items);
           const merged = Array.from(cache.values()).flat();
-          setStock(sortStock(merged));
+          const aggregated = aggregateStockItems(merged);
+          setStock(aggregated);
           setLoadingStock(false);
         },
         (err) => {
@@ -228,6 +351,42 @@ export default function StockScreen() {
     return () => unsubscribes.forEach((fn) => fn && fn());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stockFridgeKey]);
+
+  useEffect(() => {
+    const missing = history
+      .map((log) => log.byUid)
+      .filter((uid) => uid && !userNameCache[uid]);
+    const uniqueMissing = Array.from(new Set(missing));
+    if (!uniqueMissing.length) return;
+    let cancelled = false;
+    (async () => {
+      const updates = {};
+      for (const uid of uniqueMissing) {
+        try {
+          const snap = await getDoc(doc(db, "users", uid));
+          if (snap.exists()) {
+            const data = snap.data() || {};
+            updates[uid] =
+              data.displayName ||
+              data.name ||
+              data.email ||
+              `Member ${uid.slice(-4).toUpperCase()}`;
+          } else {
+            updates[uid] = `Member ${uid.slice(-4).toUpperCase()}`;
+          }
+        } catch (err) {
+          console.warn("user lookup failed", err);
+          updates[uid] = `Member ${uid.slice(-4).toUpperCase()}`;
+        }
+      }
+      if (!cancelled && Object.keys(updates).length) {
+        setUserNameCache((prev) => ({ ...prev, ...updates }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [history, userNameCache]);
 
   useEffect(() => {
     if (!stockFridges.length) {
@@ -274,37 +433,6 @@ export default function StockScreen() {
   }, [stockFridgeKey]);
 
   useEffect(() => {
-    if (!isSingleFridge) {
-      if (Object.keys(removalDraft).length) setRemovalDraft({});
-      return;
-    }
-    setRemovalDraft((prev) => {
-      const next = {};
-      let changed = false;
-      stock.forEach((item) => {
-        const current = prev[item.id] || 0;
-        if (!current) return;
-        const max = Number(item.qty) || 0;
-        if (max <= 0) {
-          changed = true;
-          return;
-        }
-        const clamped = Math.min(current, max);
-        if (clamped !== current) changed = true;
-        if (clamped > 0) next[item.id] = clamped;
-      });
-      if (
-        !changed &&
-        Object.keys(next).length === Object.keys(prev).length &&
-        Object.keys(next).every((k) => next[k] === prev[k])
-      ) {
-        return prev;
-      }
-      return next;
-    });
-  }, [isSingleFridge, stock]);
-
-  useEffect(() => {
     if (!scanOpen) return;
     (async () => {
       if (!permission) {
@@ -328,87 +456,30 @@ export default function StockScreen() {
     return stock;
   }, [stock, activeFilter]);
   const stats = useMemo(() => {
-    const totalItems = stock.length;
+    let totalQty = 0;
     let expCount = 0;
     let lowCount = 0;
     stock.forEach((item) => {
+      totalQty += Number(item.qty) || 0;
       if (item._isExpiring) expCount += 1;
       if (item._isLow) lowCount += 1;
     });
-    return { totalItems, expCount, lowCount };
+    return { totalQty, expCount, lowCount };
   }, [stock]);
 
-  const adjustRemoval = (itemId, delta, maxQty) => {
-    setRemovalDraft((prev) => {
-      const current = prev[itemId] || 0;
-      const next = Math.max(0, Math.min(maxQty, current + delta));
-      if (next <= 0) {
-        if (!prev[itemId]) return prev;
-        const { [itemId]: _, ...rest } = prev;
-        return rest;
-      }
-      return { ...prev, [itemId]: next };
-    });
-  };
-
-  const handleRemove = async (item) => {
-    const amount = removalDraft[item.id] || 0;
-    if (amount <= 0) {
+  const addItem = async () => {
+    const targetFridgeId = selectedFridgeId;
+    if (!targetFridgeId) {
       Alert.alert(
-        "Choose quantity",
-        "Set how many items to remove before confirming."
+        "Select a fridge",
+        "Choose which fridge to add this item to before saving."
       );
       return;
     }
-    setProcessingId(item.id);
-    try {
-      const stockRef = doc(db, "fridges", item.fridgeId, "stock", item.id);
-      const snap = await getDoc(stockRef);
-      if (!snap.exists()) {
-        Alert.alert("Item not found", "This entry was removed already.");
-        return;
-      }
-      const data = snap.data() || {};
-      const currentQty = Number(data.qty) || 0;
-      if (currentQty <= 0) {
-        Alert.alert("Nothing left", "The quantity is already zero.");
-        return;
-      }
-      const actualAmount = Math.min(amount, currentQty);
-      const batch = writeBatch(db);
-      batch.update(stockRef, {
-        qty: Math.max(0, currentQty - actualAmount),
-        updatedAt: serverTimestamp(),
-      });
-      const historyRef = doc(
-        collection(db, "fridges", item.fridgeId, "stockHistory")
-      );
-      batch.set(historyRef, {
-        type: "remove",
-        name: data.name || item.name,
-        qty: actualAmount,
-        unit: data.unit || item.unit || DEFAULT_UNIT,
-        stockId: stockRef.id,
-        byUid: user?.uid || null,
-        ts: serverTimestamp(),
-      });
-      await batch.commit();
-      setRemovalDraft((prev) => {
-        const { [item.id]: _, ...rest } = prev;
-        return rest;
-      });
-    } catch (err) {
-      Alert.alert("Could not remove items", err.message || "Something went wrong");
-    } finally {
-      setProcessingId(null);
-    }
-  };
-
-  const addItem = async () => {
-    if (!modeFridgeId) {
+    if (!targetFridges.includes(targetFridgeId)) {
       Alert.alert(
-        "Select a fridge",
-        "Open this screen from a specific fridge in Home before adding items."
+        "Access denied",
+        "You can only add stock to fridges you are a member of."
       );
       return;
     }
@@ -416,56 +487,131 @@ export default function StockScreen() {
       Alert.alert("Name required", "Please fill in the item name before saving.");
       return;
     }
+    const numericQty = Number(form.qty);
+    const safeQty = Number.isFinite(numericQty) && numericQty > 0 ? numericQty : 1;
+    const parsedDate = form.expireDate ? parseInputDate(form.expireDate) : null;
+    if (form.expireDate && !parsedDate) {
+      Alert.alert(
+        "Invalid date",
+        "Please choose a valid expiry date (format YYYY-MM-DD)."
+      );
+      return;
+    }
     try {
-      const expTimestamp = form.expireDate
-        ? Timestamp.fromDate(new Date(form.expireDate))
-        : null;
+      const expTimestamp = parsedDate ? Timestamp.fromDate(parsedDate) : null;
       const batch = writeBatch(db);
-      const stockRef = doc(collection(db, "fridges", modeFridgeId, "stock"));
+      const stockRef = doc(collection(db, "fridges", targetFridgeId, "stock"));
+      const trimmedBarcode = form.barcode.trim();
+      const trimmedName = form.name.trim();
+      const chosenUnit = form.unit || DEFAULT_UNIT;
       batch.set(stockRef, {
-        name: form.name.trim(),
-        qty: Number(form.qty) || 1,
-        unit: form.unit || DEFAULT_UNIT,
+        name: trimmedName,
+        qty: safeQty,
+        unit: chosenUnit,
         expireDate: expTimestamp,
-        barcode: form.barcode || "",
+        barcode: trimmedBarcode,
         lowThreshold: 1,
+        status: "in_stock",
+        createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
+        addedBy: user?.uid || null,
+        updatedBy: user?.uid || null,
       });
       const historyRef = doc(
-        collection(db, "fridges", modeFridgeId, "stockHistory")
+        collection(db, "fridges", targetFridgeId, "stockHistory")
       );
       batch.set(historyRef, {
         type: "add",
-        name: form.name.trim(),
-        qty: Number(form.qty) || 1,
-        unit: form.unit || DEFAULT_UNIT,
+        name: trimmedName,
+        qty: safeQty,
+        unit: chosenUnit,
         stockId: stockRef.id,
         byUid: user?.uid || null,
+        byName: currentUserName,
         ts: serverTimestamp(),
       });
-      if (form.barcode.trim()) {
+      if (trimmedBarcode) {
         batch.set(
-          doc(db, "barcodes", form.barcode.trim()),
+          doc(db, "barcodes", trimmedBarcode),
           {
-            name: form.name.trim(),
-            unitDefault: form.unit || DEFAULT_UNIT,
+            name: trimmedName,
+            unitDefault: chosenUnit,
             updatedAt: serverTimestamp(),
           },
           { merge: true }
         );
       }
       await batch.commit();
-      setForm({
+      setForm((prev) => ({
         name: "",
         qty: "1",
-        unit: DEFAULT_UNIT,
+        unit: prev.unit || DEFAULT_UNIT,
         expireDate: "",
         barcode: "",
-      });
+        fridgeId: prev.fridgeId || targetFridgeId,
+      }));
       setShowAdd(false);
     } catch (err) {
       Alert.alert("Could not save item", err.message || "Something went wrong");
     }
+  };
+
+  const handleUnitSelect = (unitValue) => {
+    if (unitValue === OTHER_UNIT_VALUE) {
+      setUnitModalOpen(false);
+      const currentUnit = (form.unit || "").trim();
+      setCustomUnitDraft(
+        currentUnit &&
+          !UNIT_OPTIONS.some(
+            (opt) =>
+              opt !== OTHER_UNIT_VALUE &&
+              opt.toLowerCase() === currentUnit.toLowerCase()
+          )
+          ? currentUnit
+          : ""
+      );
+      setCustomUnitModalOpen(true);
+      return;
+    }
+    setForm((prev) => ({ ...prev, unit: unitValue || DEFAULT_UNIT }));
+    setUnitModalOpen(false);
+  };
+
+  const handleFridgeSelect = (fid) => {
+    setForm((prev) => ({ ...prev, fridgeId: fid }));
+    setFridgeModalOpen(false);
+  };
+
+  const handleSaveCustomUnit = () => {
+    const trimmed = customUnitDraft.trim();
+    if (!trimmed) {
+      Alert.alert("Unit required", "Please enter a unit name.");
+      return;
+    }
+    setForm((prev) => ({ ...prev, unit: trimmed }));
+    setCustomUnitModalOpen(false);
+  };
+
+  const openDatePicker = () => {
+    const baseDate =
+      parseInputDate(form.expireDate) || new Date();
+    if (Platform.OS === "android") {
+      DateTimePickerAndroid.open({
+        mode: "date",
+        value: baseDate,
+        onChange: (_, selectedDate) => {
+          if (selectedDate) {
+            setForm((prev) => ({
+              ...prev,
+              expireDate: formatInputDate(selectedDate),
+            }));
+          }
+        },
+      });
+      return;
+    }
+    setIosDateValue(baseDate);
+    setIosDatePickerVisible(true);
   };
 
   const onScan = async ({ data }) => {
@@ -500,17 +646,14 @@ export default function StockScreen() {
   };
 
   const statCards = [
-    { key: "all", label: "All items", value: stats.totalItems, note: "records" },
-    { key: "exp", label: "Expiring soon", value: stats.expCount, note: "records" },
-    { key: "low", label: "Low stock", value: stats.lowCount, note: "records" },
+    { key: "all", label: "All items", value: stats.totalQty },
+    { key: "exp", label: "Expiring soon", value: stats.expCount },
+    { key: "low", label: "Low stock", value: stats.lowCount },
   ];
 
-  const headerTitle = isSingleFridge
-    ? `Items in ${fridgeMeta[modeFridgeId]?.name || "this fridge"}`
-    : "All fridges overview";
-  const headerSubtitle = isSingleFridge
-    ? "Adjust the quantity and tap remove to sync instantly."
-    : `Tracking ${targetFridges.length} fridges - tap a category to filter items.`;
+  const headerTitle = "All fridges overview";
+  const headerSubtitle = `Tracking ${fridgeCount} fridge${fridgeCount === 1 ? "" : "s"} - tap a category to filter items.`;
+  const showHistoryOnly = activeFilter === "none";
 
   const renderItem = ({ item }) => {
     const fridgeLabel =
@@ -520,10 +663,6 @@ export default function StockScreen() {
     if (item._isExpiring) badges.push({ text: "Expiring soon", tone: "warn" });
     if (item._isLow) badges.push({ text: "Low stock", tone: "danger" });
     const available = Number(item.qty) || 0;
-    const pending = removalDraft[item.id] || 0;
-    const disableMinus = processingId === item.id || pending <= 0;
-    const disablePlus =
-      processingId === item.id || pending >= available || available <= 0;
     const expiresOn = formatDate(item.expireDate);
 
     return (
@@ -535,15 +674,13 @@ export default function StockScreen() {
               In stock {available} {item.unit}
             </Text>
           </View>
-          {!isSingleFridge && (
-            <View style={styles.fridgeBadge}>
-              <Text style={styles.fridgeBadgeText}>{fridgeLabel}</Text>
-            </View>
-          )}
+          <View style={styles.fridgeBadge}>
+            <Text style={styles.fridgeBadgeText}>{fridgeLabel}</Text>
+          </View>
         </View>
 
         {badges.length > 0 && (
-          <View style={styles.badgeRow}>
+          <View style={[styles.badgeRow, { marginTop: 8 }]}>
             {badges.map((badge) => (
               <View
                 key={`${item.id}_${badge.text}`}
@@ -567,59 +704,10 @@ export default function StockScreen() {
           </View>
         )}
 
-        <View style={styles.metaRow}>
+        <View style={[styles.metaRow, { marginTop: 12 }]}>
           <Text style={styles.metaLabel}>Expires on</Text>
           <Text style={styles.metaValue}>{expiresOn}</Text>
         </View>
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLabel}>Barcode</Text>
-          <Text style={styles.metaValue}>{item.barcode || "-"}</Text>
-        </View>
-
-        {isSingleFridge && (
-          <>
-            <View style={styles.selectorRow}>
-              <TouchableOpacity
-                style={[
-                  styles.selectorBtn,
-                  disableMinus && styles.selectorBtnDisabled,
-                ]}
-                onPress={() => adjustRemoval(item.id, -1, available)}
-                disabled={disableMinus}
-              >
-                <Text style={styles.selectorText}>-</Text>
-              </TouchableOpacity>
-              <Text style={styles.selectorValue}>{pending}</Text>
-              <TouchableOpacity
-                style={[
-                  styles.selectorBtn,
-                  disablePlus && styles.selectorBtnDisabled,
-                ]}
-                onPress={() => adjustRemoval(item.id, 1, available)}
-                disabled={disablePlus}
-              >
-                <Text style={styles.selectorText}>+</Text>
-              </TouchableOpacity>
-            </View>
-            <TouchableOpacity
-              style={[
-                styles.removeButton,
-                (pending <= 0 || processingId === item.id) &&
-                  styles.removeButtonDisabled,
-              ]}
-              disabled={pending <= 0 || processingId === item.id}
-              onPress={() => handleRemove(item)}
-            >
-              {processingId === item.id ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.removeButtonText}>
-                  Remove {pending || 0} {item.unit}
-                </Text>
-              )}
-            </TouchableOpacity>
-          </>
-        )}
       </View>
     );
   };
@@ -638,6 +726,13 @@ export default function StockScreen() {
           const fridgeLabel =
             fridgeMeta[log.fridgeId]?.name ||
             `Fridge ${log.fridgeId.slice(-4).toUpperCase()}`;
+          const actor =
+            (typeof log.byName === "string" && log.byName.trim()) ||
+            (log.byUid && userNameCache[log.byUid]
+              ? userNameCache[log.byUid]
+              : log.byUid
+              ? `Member ${log.byUid.slice(-4).toUpperCase()}`
+              : "Unknown member");
           return (
             <View
               key={`${log.fridgeId}_${log.id}`}
@@ -651,11 +746,16 @@ export default function StockScreen() {
                     x{log.qty} {log.unit || ""}
                   </Text>
                 </View>
-                {!isSingleFridge && (
-                  <Text style={styles.historyMeta}>{fridgeLabel}</Text>
-                )}
+                <Text style={styles.historyMeta}>
+                  {fridgeLabel}
+                </Text>
+                <Text style={styles.historyMetaSmall}>
+                  {formatDateTime(log.ts)}
+                </Text>
+                <Text style={styles.historyMetaSmall}>
+                  by {actor}
+                </Text>
               </View>
-              <Text style={styles.historyTime}>{formatDateTime(log.ts)}</Text>
             </View>
           );
         })
@@ -678,7 +778,6 @@ export default function StockScreen() {
           >
             <Text style={styles.dashboardValue}>{card.value}</Text>
             <Text style={styles.dashboardLabel}>{card.label}</Text>
-            <Text style={styles.dashboardNote}>{card.note}</Text>
           </TouchableOpacity>
         ))}
       </View>
@@ -692,31 +791,40 @@ export default function StockScreen() {
         keyExtractor={(item) => `${item.fridgeId}_${item.id}`}
         renderItem={renderItem}
         ListHeaderComponent={listHeader}
-        ListFooterComponent={activeFilter === "none" ? HistorySection : null}
+        ListFooterComponent={showHistoryOnly ? HistorySection : null}
         contentContainerStyle={styles.listContent}
         showsVerticalScrollIndicator={false}
         ListEmptyComponent={
-          loadingStock ? (
-            <ActivityIndicator style={{ marginTop: 32, alignSelf: "center" }} />
-          ) : (
-            <Text style={[styles.emptyText, { marginTop: 32 }]}>
-              {activeFilter === "none"
-                ? "Select a category above to view matching items."
-                : "No items in this filter"}
-            </Text>
-          )
+          showHistoryOnly
+            ? null
+            : loadingStock ? (
+                <ActivityIndicator
+                  style={{ marginTop: 32, alignSelf: "center" }}
+                />
+              ) : (
+                <View style={styles.emptyCard}>
+                  <Text style={styles.emptyCardTitle}>
+                    {activeFilter === "exp"
+                      ? "Nothing expiring soon"
+                      : activeFilter === "low"
+                      ? "No low stock items"
+                      : "No items in this filter"}
+                  </Text>
+                  <Text style={styles.emptyCardSubtitle}>
+                    Switch filters or adjust your selection to keep browsing.
+                  </Text>
+                </View>
+              )
         }
       />
 
-      {isSingleFridge && (
-        <TouchableOpacity
-          style={styles.fab}
-          onPress={() => setShowAdd(true)}
-          activeOpacity={0.8}
-        >
-          <Text style={styles.fabText}>+</Text>
-        </TouchableOpacity>
-      )}
+      <TouchableOpacity
+        style={styles.fab}
+        onPress={() => setShowAdd(true)}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.fabText}>+</Text>
+      </TouchableOpacity>
 
       <Modal
         visible={showAdd}
@@ -728,6 +836,32 @@ export default function StockScreen() {
           <Text style={styles.modalHint}>
             Fill the details or scan a barcode to preload information.
           </Text>
+
+          <>
+            <TouchableOpacity
+              style={[
+                styles.input,
+                styles.selectorInput,
+                !selectedFridgeId && styles.selectorInputPlaceholder,
+              ]}
+              onPress={() => setFridgeModalOpen(true)}
+              activeOpacity={0.85}
+            >
+              <Text
+                style={[
+                  styles.selectorInputText,
+                  !selectedFridgeId && styles.selectorPlaceholderText,
+                ]}
+              >
+                {selectedFridgeLabel}
+              </Text>
+            </TouchableOpacity>
+            {fridgeOptions.length === 0 && (
+              <Text style={styles.helperText}>
+                Join or create a fridge to start tracking items.
+              </Text>
+            )}
+          </>
 
           <TextInput
             style={styles.input}
@@ -744,24 +878,33 @@ export default function StockScreen() {
               value={form.qty}
               onChangeText={(text) => setForm((prev) => ({ ...prev, qty: text }))}
             />
-            <TextInput
-              style={[styles.input, styles.halfInput]}
-              placeholder="Unit (e.g. pcs, bottle)"
-              value={form.unit}
-              onChangeText={(text) =>
-                setForm((prev) => ({ ...prev, unit: text }))
-              }
-            />
+            <TouchableOpacity
+              style={[styles.input, styles.halfInput, styles.selectorInput]}
+              onPress={() => setUnitModalOpen(true)}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.selectorInputText}>
+                {form.unit || DEFAULT_UNIT}
+              </Text>
+            </TouchableOpacity>
           </View>
 
-          <TextInput
-            style={styles.input}
-            placeholder="Expiry date (YYYY-MM-DD)"
-            value={form.expireDate}
-            onChangeText={(text) =>
-              setForm((prev) => ({ ...prev, expireDate: text }))
-            }
-          />
+          <View style={styles.row}>
+            <TextInput
+              style={[styles.input, styles.flexInput]}
+              placeholder="Expiry date (YYYY-MM-DD)"
+              value={form.expireDate}
+              onChangeText={(text) =>
+                setForm((prev) => ({ ...prev, expireDate: text }))
+              }
+            />
+            <TouchableOpacity
+              style={[styles.secondaryButton, styles.pickerButton]}
+              onPress={() => openDatePicker()}
+            >
+              <Text style={styles.secondaryButtonText}>Pick date</Text>
+            </TouchableOpacity>
+          </View>
 
           <View style={styles.row}>
             <TextInput
@@ -830,6 +973,198 @@ export default function StockScreen() {
           )}
         </View>
       </Modal>
+
+      <Modal
+        visible={unitModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUnitModalOpen(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <TouchableOpacity
+            style={styles.modalBackdrop}
+            activeOpacity={1}
+            onPress={() => setUnitModalOpen(false)}
+          />
+          <View style={styles.modalSheet}>
+            <Text style={styles.modalSheetTitle}>Select unit</Text>
+            <ScrollView style={{ maxHeight: 280 }}>
+              {UNIT_OPTIONS.map((option) => {
+                const isOther = option === OTHER_UNIT_VALUE;
+                const optionLabel = isOther ? "Other (type manually)" : option;
+                const normalized = (form.unit || DEFAULT_UNIT).toLowerCase();
+                const active = isOther
+                  ? !UNIT_OPTIONS.some(
+                      (opt) =>
+                        opt !== OTHER_UNIT_VALUE &&
+                        opt.toLowerCase() === normalized
+                    )
+                  : normalized === option.toLowerCase();
+                return (
+                  <TouchableOpacity
+                    key={option}
+                    style={[
+                      styles.modalOption,
+                      active && styles.modalOptionActive,
+                    ]}
+                    onPress={() => handleUnitSelect(option)}
+                  >
+                    <Text
+                      style={[
+                      styles.modalOptionText,
+                      active && styles.modalOptionTextActive,
+                    ]}
+                  >
+                      {optionLabel}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={customUnitModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setCustomUnitModalOpen(false);
+          setCustomUnitDraft("");
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <TouchableOpacity
+            style={styles.modalBackdrop}
+            activeOpacity={1}
+            onPress={() => setCustomUnitModalOpen(false)}
+          />
+          <View style={styles.modalSheet}>
+            <Text style={styles.modalSheetTitle}>Custom unit</Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Enter unit (e.g. bundle, tray)"
+              value={customUnitDraft}
+              onChangeText={setCustomUnitDraft}
+              autoFocus
+            />
+            <View style={styles.modalSheetActions}>
+              <TouchableOpacity
+                style={[styles.secondaryButton, styles.modalActionButton]}
+                onPress={() => {
+                  setCustomUnitModalOpen(false);
+                  setCustomUnitDraft("");
+                }}
+              >
+                <Text style={styles.secondaryButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.primaryButton, styles.modalActionButton]}
+                onPress={handleSaveCustomUnit}
+              >
+                <Text style={styles.primaryButtonText}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={fridgeModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setFridgeModalOpen(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <TouchableOpacity
+            style={styles.modalBackdrop}
+            activeOpacity={1}
+            onPress={() => setFridgeModalOpen(false)}
+          />
+          <View style={styles.modalSheet}>
+            <Text style={styles.modalSheetTitle}>Select fridge</Text>
+            {fridgeOptions.length === 0 ? (
+              <Text style={styles.helperText}>
+                You do not have any fridges yet.
+              </Text>
+            ) : (
+              <ScrollView style={{ maxHeight: 320 }}>
+                {fridgeOptions.map((option) => {
+                  const active = option.id === selectedFridgeId;
+                  return (
+                    <TouchableOpacity
+                      key={option.id}
+                      style={[
+                        styles.modalOption,
+                        active && styles.modalOptionActive,
+                      ]}
+                      onPress={() => handleFridgeSelect(option.id)}
+                    >
+                      <Text
+                        style={[
+                          styles.modalOptionText,
+                          active && styles.modalOptionTextActive,
+                        ]}
+                      >
+                        {option.name}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {Platform.OS === "ios" && (
+        <Modal
+          visible={iosDatePickerVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setIosDatePickerVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <TouchableOpacity
+              style={styles.modalBackdrop}
+              activeOpacity={1}
+              onPress={() => setIosDatePickerVisible(false)}
+            />
+            <View style={[styles.modalSheet, styles.dateSheet]}>
+              <Text style={styles.modalSheetTitle}>Select expiry date</Text>
+              <DateTimePicker
+                value={iosDateValue}
+                mode="date"
+                display="spinner"
+                onChange={(_, selectedDate) => {
+                  if (selectedDate) setIosDateValue(selectedDate);
+                }}
+              />
+              <View style={styles.modalSheetActions}>
+                <TouchableOpacity
+                  style={[styles.secondaryButton, styles.modalActionButton]}
+                  onPress={() => setIosDatePickerVisible(false)}
+                >
+                  <Text style={styles.secondaryButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.primaryButton, styles.modalActionButton]}
+                  onPress={() => {
+                    setForm((prev) => ({
+                      ...prev,
+                      expireDate: formatInputDate(iosDateValue),
+                    }));
+                    setIosDatePickerVisible(false);
+                  }}
+                >
+                  <Text style={styles.primaryButtonText}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      )}
     </View>
   );
 }
@@ -895,10 +1230,6 @@ const styles = StyleSheet.create({
     color: "#1F2A5C",
     fontWeight: "600",
   },
-  dashboardNote: {
-    color: "#6B7280",
-    fontSize: 12,
-  },
   card: {
     backgroundColor: "#FFFFFF",
     borderRadius: 18,
@@ -912,7 +1243,7 @@ const styles = StyleSheet.create({
   },
   cardHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     marginBottom: 8,
   },
   cardTitle: {
@@ -921,7 +1252,7 @@ const styles = StyleSheet.create({
     color: "#1F2A5C",
   },
   cardQty: {
-    marginTop: 4,
+    marginTop: 6,
     color: "#3563E9",
     fontWeight: "700",
   },
@@ -939,7 +1270,7 @@ const styles = StyleSheet.create({
   badgeRow: {
     flexDirection: "row",
     gap: 8,
-    marginBottom: 8,
+    flexWrap: "wrap",
   },
   badge: {
     paddingHorizontal: 10,
@@ -974,48 +1305,6 @@ const styles = StyleSheet.create({
   metaValue: {
     color: "#1F2A5C",
     fontWeight: "600",
-  },
-  selectorRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 16,
-  },
-  selectorBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#EEF4FF",
-  },
-  selectorBtnDisabled: {
-    opacity: 0.35,
-  },
-  selectorText: {
-    fontSize: 22,
-    fontWeight: "800",
-    color: "#2D5BFF",
-  },
-  selectorValue: {
-    marginHorizontal: 20,
-    fontSize: 18,
-    fontWeight: "700",
-    color: "#1F2A5C",
-  },
-  removeButton: {
-    marginTop: 16,
-    backgroundColor: "#EB5757",
-    borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  removeButtonDisabled: {
-    backgroundColor: "#F6B7B7",
-  },
-  removeButtonText: {
-    color: "#FFFFFF",
-    fontWeight: "700",
   },
   sectionTitle: {
     fontSize: 16,
@@ -1061,6 +1350,26 @@ const styles = StyleSheet.create({
   emptyText: {
     textAlign: "center",
     color: "#9CA3AF",
+  },
+  emptyCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    paddingVertical: 24,
+    paddingHorizontal: 20,
+    marginTop: 24,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+  emptyCardTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1F2A5C",
+  },
+  emptyCardSubtitle: {
+    marginTop: 6,
+    color: "#6B7280",
+    textAlign: "center",
   },
   fab: {
     position: "absolute",
@@ -1115,9 +1424,30 @@ const styles = StyleSheet.create({
   halfInput: {
     flex: 1,
   },
+  flexInput: {
+    flex: 1,
+  },
   barcodeInput: {
     flex: 1,
     marginRight: 12,
+  },
+  selectorInput: {
+    justifyContent: "center",
+  },
+  selectorInputPlaceholder: {
+    borderColor: "#D1D5DB",
+  },
+  selectorInputText: {
+    fontWeight: "600",
+    color: "#1F2A5C",
+  },
+  selectorPlaceholderText: {
+    color: "#9CA3AF",
+  },
+  helperText: {
+    marginTop: 6,
+    color: "#9CA3AF",
+    fontSize: 12,
   },
   modalActions: {
     flexDirection: "row",
@@ -1142,6 +1472,10 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: "center",
   },
+  pickerButton: {
+    marginLeft: 12,
+    paddingHorizontal: 16,
+  },
   secondaryButtonText: {
     color: "#2D5BFF",
     fontWeight: "700",
@@ -1164,5 +1498,67 @@ const styles = StyleSheet.create({
     textAlign: "center",
     color: "#1F2A5C",
   },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(17, 24, 39, 0.45)",
+    justifyContent: "center",
+    padding: 24,
+  },
+  modalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  modalSheet: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    padding: 20,
+    elevation: 6,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.2,
+    shadowRadius: 24,
+  },
+  modalSheetTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#1F2A5C",
+    marginBottom: 12,
+  },
+  modalOption: {
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    marginBottom: 4,
+  },
+  modalOptionActive: {
+    backgroundColor: "#EEF4FF",
+  },
+  modalOptionText: {
+    fontSize: 16,
+    color: "#1F2A5C",
+  },
+  modalOptionTextActive: {
+    fontWeight: "700",
+    color: "#2D5BFF",
+  },
+  modalInput: {
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: "#F9FAFB",
+    marginTop: 12,
+  },
+  dateSheet: {
+    paddingBottom: 16,
+  },
+  modalSheetActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 12,
+    marginTop: 12,
+  },
+  modalActionButton: {
+    minWidth: 100,
+  },
 });
-

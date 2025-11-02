@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, View } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -104,43 +105,47 @@ export default function App() {
 
   if (loading) {
     return (
-      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-        <ActivityIndicator size="large" />
-      </View>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+          <ActivityIndicator size="large" />
+        </View>
+      </GestureHandlerRootView>
     );
   }
 
   return (
-    <AppCtx.Provider value={ctxValue}>
-      <SafeAreaProvider>
-        <NavigationContainer theme={{ ...DefaultTheme }}>
-          <Stack.Navigator screenOptions={{ headerTitleAlign: 'center' }}>
-            {user ? (
-              <>
-                <Stack.Screen name="Main" component={MainTabs} options={{ headerShown: false }} />
-                <Stack.Screen
-                  name="FridgeDetail"
-                  component={FridgeDetailScreen}
-                  options={{ title: 'Fridge Details' }}
-                />
-              </>
-            ) : (
-              <>
-                <Stack.Screen
-                  name="Login"
-                  component={LoginScreen}
-                  options={{ title: 'Sign In' }}
-                />
-                <Stack.Screen
-                  name="Register"
-                  component={RegisterScreen}
-                  options={{ title: 'Create Account' }}
-                />
-              </>
-            )}
-          </Stack.Navigator>
-        </NavigationContainer>
-      </SafeAreaProvider>
-    </AppCtx.Provider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AppCtx.Provider value={ctxValue}>
+        <SafeAreaProvider>
+          <NavigationContainer theme={{ ...DefaultTheme }}>
+            <Stack.Navigator screenOptions={{ headerTitleAlign: 'center' }}>
+              {user ? (
+                <>
+                  <Stack.Screen name="Main" component={MainTabs} options={{ headerShown: false }} />
+                  <Stack.Screen
+                    name="FridgeDetail"
+                    component={FridgeDetailScreen}
+                    options={{ title: 'Fridge Details' }}
+                  />
+                </>
+              ) : (
+                <>
+                  <Stack.Screen
+                    name="Login"
+                    component={LoginScreen}
+                    options={{ title: 'Sign In' }}
+                  />
+                  <Stack.Screen
+                    name="Register"
+                    component={RegisterScreen}
+                    options={{ title: 'Create Account' }}
+                  />
+                </>
+              )}
+            </Stack.Navigator>
+          </NavigationContainer>
+        </SafeAreaProvider>
+      </AppCtx.Provider>
+    </GestureHandlerRootView>
   );
 }
