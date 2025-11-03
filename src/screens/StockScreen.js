@@ -1,4 +1,4 @@
-﻿import { useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -142,7 +142,7 @@ const aggregateStockItems = (items) => {
 };
 
 export default function StockScreen() {
-  const { user, profile } = useContext(AppCtx);
+  const { user, profile, setCurrentFridge } = useContext(AppCtx);
   const currentUserName =
     profile?.displayName?.trim() ||
     user?.displayName?.trim() ||
@@ -647,6 +647,10 @@ export default function StockScreen() {
         }
       }
       const batch = writeBatch(db);
+      const fridgeLabel =
+        (typeof fridgeMeta[item.fridgeId]?.name === "string" &&
+          fridgeMeta[item.fridgeId].name.trim()) ||
+        `Fridge ${item.fridgeId.slice(-4).toUpperCase()}`;
       if (targetDocSnap) {
         const prevQty = Number(targetDocSnap.data()?.qty) || 0;
         batch.update(targetDocSnap.ref, {
@@ -658,6 +662,8 @@ export default function StockScreen() {
           lowThreshold:
             Number(targetDocSnap.data()?.lowThreshold) ||
             Math.max(1, Math.round(Number(item.lowThreshold) || 1)),
+          fridgeId: item.fridgeId,
+          fridgeName: fridgeLabel,
         });
       } else {
         const newRef = doc(listCol);
@@ -670,9 +676,19 @@ export default function StockScreen() {
           lowThreshold: Math.max(1, Math.round(Number(item.lowThreshold) || 1)),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
+          fridgeId: item.fridgeId,
+          fridgeName: fridgeLabel,
         });
       }
       await batch.commit();
+      if (
+        typeof setCurrentFridge === "function" &&
+        profile?.currentFridgeId !== item.fridgeId
+      ) {
+        setCurrentFridge(item.fridgeId).catch((err) =>
+          console.warn("sync current fridge after shopping add failed", err)
+        );
+      }
       Alert.alert(
         "Added to shopping list",
         `${item.name} (${qty} ${item.unit}) added to the shopping list.`

@@ -100,7 +100,7 @@ const aggregateFridgeItems = (docs) => {
 export default function FridgeDetailScreen() {
   const { params } = useRoute();
   const navigation = useNavigation();
-  const { user, profile } = useContext(AppCtx);
+  const { user, profile, setCurrentFridge } = useContext(AppCtx);
   const currentUserName =
     profile?.displayName?.trim() ||
     user?.displayName?.trim() ||
@@ -115,6 +115,18 @@ export default function FridgeDetailScreen() {
   const [removals, setRemovals] = useState({});
   const [activeFilter, setActiveFilter] = useState("all"); // all | exp | low
   const [bulkLoading, setBulkLoading] = useState(null); // null | "remove" | "shopping"
+
+  useEffect(() => {
+    if (
+      fridgeId &&
+      setCurrentFridge &&
+      profile?.currentFridgeId !== fridgeId
+    ) {
+      setCurrentFridge(fridgeId).catch((err) =>
+        console.warn("sync current fridge failed", err)
+      );
+    }
+  }, [fridgeId, profile?.currentFridgeId, setCurrentFridge]);
 
   useEffect(() => {
     if (!fridgeId) {
@@ -404,13 +416,18 @@ export default function FridgeDetailScreen() {
     try {
       const batch = writeBatch(db);
       let hasWrite = false;
+      const fridgeName =
+        (typeof fridge?.name === "string" && fridge.name.trim()) ||
+        `Fridge ${fridgeId.slice(-4).toUpperCase()}`;
       selectionEntries.forEach(([itemId, qty]) => {
         const item = itemMap.get(itemId);
         if (!item || qty <= 0) return;
         const ref = doc(collection(db, "fridges", fridgeId, "shopping"));
         const stockDocId = item.documents?.[0]?.id || itemId;
+        const normalizedName = (item.name || "").trim();
         batch.set(ref, {
-          name: item.name,
+          name: normalizedName,
+          nameLower: normalizedName.toLowerCase(),
           qty,
           unit: item.unit || DEFAULT_UNIT,
           status: "pending",
@@ -420,6 +437,7 @@ export default function FridgeDetailScreen() {
           expireDate: item.expireDate || null,
           byUid: user?.uid || null,
           fridgeId,
+          fridgeName,
         });
         hasWrite = true;
       });
@@ -429,6 +447,14 @@ export default function FridgeDetailScreen() {
         return;
       }
       await batch.commit();
+      if (
+        typeof setCurrentFridge === "function" &&
+        profile?.currentFridgeId !== fridgeId
+      ) {
+        setCurrentFridge(fridgeId).catch((err) =>
+          console.warn("sync current fridge after add failed", err)
+        );
+      }
       setRemovals({});
       Alert.alert(
         "Added to shopping list",

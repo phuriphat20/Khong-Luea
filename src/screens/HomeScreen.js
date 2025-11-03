@@ -27,8 +27,6 @@ import {
   onSnapshot,
   query,
   where,
-  addDoc,
-  setDoc,
   serverTimestamp,
 } from "firebase/firestore";
 import { useNavigation } from "@react-navigation/native";
@@ -36,7 +34,8 @@ import { useNavigation } from "@react-navigation/native";
 const THREE_DAYS = 3 * 24 * 3600 * 1000;
 
 export default function HomeScreen() {
-  const { user, profile } = useContext(AppCtx);
+  const { user, profile, setPendingJoinCode } =
+    useContext(AppCtx);
   const navigation = useNavigation();
 
   const [loading, setLoading] = useState(true);
@@ -63,9 +62,20 @@ const genCode = (len = 6) => {
 
 
 
-const copyCode = async (fid) => {
-  await Clipboard.setStringAsync(fid);
-  Alert.alert("Copied", "Invite code copied to clipboard.");
+const copyCode = async (rawCode) => {
+  const normalized = (rawCode || "").toString().trim().toUpperCase();
+  if (!normalized) {
+    Alert.alert("Invite code unavailable", "This fridge does not have an invite code yet.");
+    return;
+  }
+  try {
+    await Clipboard.setStringAsync(normalized);
+    setPendingJoinCode(normalized);
+    Alert.alert("Copied", "Invite code copied to clipboard.");
+  } catch (err) {
+    console.warn("copy invite code failed", err);
+    Alert.alert("Copy failed", "Could not copy the invite code. Please try again.");
+  }
 };
 
   // โหลดรายการตู้เย็นทั้งหมดที่เราเป็นสมาชิก
@@ -136,62 +146,87 @@ const copyCode = async (fid) => {
     };
 
     // helper: ดึงข้อมูลตู้ + นับสมาชิก + สมัครฟัง stock
-    const attachFridge = async (fid) => {
-      // ถ้ามีแล้ว ไม่ต้องซ้ำ
-      if (stockUnsubs.has(fid)) return;
+    const attachFridge = async (fid, membershipRole = "member") => {
+      const alreadyAttached = stockUnsubs.has(fid);
 
-      // 1) ดึงข้อมูลตู้
-      const fRef = doc(db, "fridges", fid);
-      const fSnap = await getDoc(fRef);
-      if (!fSnap.exists()) return;
-      const fdata = fSnap.data();
+      try {
+        // 1) ดึงข้อมูลตู้
+        const fRef = doc(db, "fridges", fid);
+        const fSnap = await getDoc(fRef);
+        if (!fSnap.exists()) return;
+        const fdata = fSnap.data();
 
-      // 2) นับสมาชิก
-      const memSnap = await getDocs(collection(db, "fridges", fid, "members"));
-      const memberCount = memSnap.size;
+        // 2) นับสมาชิก (อาจถูกจำกัดสิทธิ์)
+        let memberCount = null;
+        try {
+          const memSnap = await getDocs(collection(db, "fridges", fid, "members"));
+          memberCount = memSnap.size;
+        } catch (err) {
+          if (err?.code !== "permission-denied") {
+            console.warn("member snapshot error:", err?.message || err);
+          }
+        }
 
-      // 3) set state โครงเริ่มต้น
-      setFridges((prev) => {
-        const idx = prev.findIndex((x) => x.id === fid);
-        const createdAt =
-          typeof fdata?.createdAt?.toMillis === "function" ? fdata.createdAt.toMillis() : 0;
+        // 3) set state โครงเริ่มต้น
+        setFridges((prev) => {
+          const idx = prev.findIndex((x) => x.id === fid);
+          const createdAt =
+            typeof fdata?.createdAt?.toMillis === "function" ? fdata.createdAt.toMillis() : 0;
+          const resolvedMemberCount =
+          typeof memberCount === "number"
+            ? memberCount
+            : idx === -1
+            ? 1
+            : prev[idx]?.memberCount ?? 1;
         const baseRow = {
           id: fid,
           name: fdata.name || "-",
           inviteCode: fdata.inviteCode || "",
           createdAt,
-          memberCount,
+          memberCount: resolvedMemberCount,
+          role: membershipRole,
         };
-        if (idx === -1)
-          return sortFridgesByCreated([
-            ...prev,
-            { ...baseRow, counts: { all: 0, expSoon: 0, low: 0 } },
-          ]);
-        const copy = prev.slice();
-        copy[idx] = { ...copy[idx], ...baseRow };
-        return sortFridgesByCreated(copy);
-      });
+          if (idx === -1)
+            return sortFridgesByCreated([
+              ...prev,
+              { ...baseRow, counts: { all: 0, expSoon: 0, low: 0 } },
+            ]);
+          const copy = prev.slice();
+          copy[idx] = { ...copy[idx], ...baseRow };
+          return sortFridgesByCreated(copy);
+        });
 
-      // 4) subscribe stock ของตู้
-      const unsub = onSnapshot(
-        collection(db, "fridges", fid, "stock"),
-        (snap) => {
-          const stats = summariseStockSnapshot(snap);
-          setFridges((prev) => {
-            const idx = prev.findIndex((x) => x.id === fid);
-            if (idx === -1) return prev;
-            const copy = prev.slice();
-            copy[idx] = {
-              ...copy[idx],
-              counts: { all: stats.items, expSoon: stats.expSoon, low: stats.low },
-            };
-            return copy;
-          });
-        },
-        (e) => console.warn("stock listener error:", e?.message || e)
-      );
+        // 4) subscribe stock ของตู้
+        const unsub = onSnapshot(
+          collection(db, "fridges", fid, "stock"),
+          (snap) => {
+            const stats = summariseStockSnapshot(snap);
+            setFridges((prev) => {
+              const idx = prev.findIndex((x) => x.id === fid);
+              if (idx === -1) return prev;
+              const copy = prev.slice();
+              copy[idx] = {
+                ...copy[idx],
+                counts: { all: stats.items, expSoon: stats.expSoon, low: stats.low },
+              };
+              return copy;
+            });
+          },
+          (err) => {
+            if (err?.code !== "permission-denied") {
+              console.warn("stock listener error:", err?.message || err);
+            }
+          }
+        );
 
-      stockUnsubs.set(fid, unsub);
+        if (!alreadyAttached) {
+          stockUnsubs.set(fid, unsub);
+        }
+      } catch (err) {
+        if (err?.code !== "permission-denied") {
+          console.warn("attach fridge failed:", err?.message || err);
+        }
+      }
     };
 
     // helper: เอาตู้ที่ไม่อยู่ในสมาชิกแล้วออก + ปิด listener
@@ -217,9 +252,11 @@ const copyCode = async (fid) => {
         const fidSet = new Set();
         const attachJobs = [];
         snap.forEach((d) => {
-          const fid = d.data()?.fridgeId || d.id; // เผื่อ doc ไม่มี field
+          const data = d.data() || {};
+          const fid = data.fridgeId || d.id; // เผื่อ doc ไม่มี field
+          const role = (data.role || "member").toLowerCase();
           fidSet.add(fid);
-          attachJobs.push(attachFridge(fid));
+          attachJobs.push(attachFridge(fid, role));
         });
         await Promise.allSettled(attachJobs);
         detachMissing(fidSet);
@@ -272,8 +309,12 @@ const joinFridgeByCode = async () => {
       role: "member",
       addedAt: serverTimestamp(),
     });
+    batch.set(
+      doc(db, "users", user.uid),
+      { currentFridgeId: fid },
+      { merge: true }
+    );
     await batch.commit();
-
     setJoinCode("");
     setShowCreate(false);
   } catch (e) {
@@ -327,25 +368,19 @@ const createFridge = async () => {
       addedAt: serverTimestamp(),
     });
 
-    // map code → fid
-batch.set(doc(db, "inviteCodes", code), {
-  fridgeId: fRef.id,
-  createdBy: ownerUid,     // ← ใช้ตรวจสิทธิ์ตาม rules ใหม่
-  active: true,
-  createdAt: serverTimestamp(),
-});
+    batch.set(doc(db, "users", ownerUid), {
+      currentFridgeId: fRef.id,
+    }, { merge: true });
 
+    // map code → fid
+    batch.set(doc(db, "inviteCodes", code), {
+      fridgeId: fRef.id,
+      createdBy: ownerUid,     // ← ใช้ตรวจสิทธิ์ตาม rules ใหม่
+      active: true,
+      createdAt: serverTimestamp(),
+    });
 
     await batch.commit();
-    await setDoc(
-      doc(db, "fridges", fRef.id, "members", ownerUid),
-      {
-        uid: ownerUid,
-        role: "owner",
-        joinedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
     setNewFridgeName("");
     setShowCreate(false);
   } catch (e) {
@@ -355,11 +390,11 @@ batch.set(doc(db, "inviteCodes", code), {
   }
 };
 const renderItem = ({ item }) => {
-  const codeToShow =
-    item?.inviteCode
-      ? item.inviteCode
-      : ((item?.id || "").slice(0, 6).toUpperCase() + (item?.id?.length > 6 ? "…" : ""));
-
+  const sourceCode = (item?.inviteCode || item?.id || "").toString().trim().toUpperCase();
+  const inviteCode = sourceCode;
+  const codeToShow = inviteCode || "N/A";
+  const role = (item?.role || "").toLowerCase();
+  const roleLabel = role === "owner" ? "Owner" : role === "member" ? "Member" : "";
   return (
     <Pressable
       android_ripple={{ color: "#e9eefc" }}
@@ -370,9 +405,28 @@ const renderItem = ({ item }) => {
         <LinearGradient colors={["#ffffff", "#f9fbff"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.card}>
           <View style={s.cardHeader}>
             <Text numberOfLines={1} style={s.cardTitle}>{item?.name ?? "-"}</Text>
-            <View style={s.memberPill}>
-              <Ionicons name="people-outline" size={14} color="#3563E9" />
-              <Text style={s.memberText}>Members {item?.memberCount ?? 0}</Text>
+            <View style={s.headerMetaRow}>
+              {roleLabel ? (
+                <View
+                  style={[
+                    s.roleBadge,
+                    role === "owner" ? s.roleBadgeOwner : s.roleBadgeMember,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      s.roleBadgeText,
+                      role === "owner" ? s.roleBadgeOwnerText : s.roleBadgeMemberText,
+                    ]}
+                  >
+                    {roleLabel}
+                  </Text>
+                </View>
+              ) : null}
+              <View style={s.memberPill}>
+                <Ionicons name="people-outline" size={14} color="#3563E9" />
+                <Text style={s.memberText}>Members {item?.memberCount ?? 0}</Text>
+              </View>
             </View>
           </View>
 
@@ -382,7 +436,7 @@ const renderItem = ({ item }) => {
               <Text style={s.codeMono}>Invite code: {codeToShow}</Text>
             </View>
             <Pressable
-              onPress={() => copyCode(item.id)}
+              onPress={() => copyCode(inviteCode)}
               android_ripple={{ color: "#e1e9ff", borderless: true }}
               style={s.copyBtn}
             >
@@ -537,6 +591,11 @@ const s = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 10,
   },
+  headerMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
 
   cardTitle: { fontWeight: "800", fontSize: 18, color: "#0B132B", maxWidth: "70%" },
 
@@ -550,6 +609,27 @@ const s = StyleSheet.create({
     borderRadius: 999,
   },
   memberText: { color: "#3563E9", fontWeight: "700", fontSize: 12 },
+  roleBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  roleBadgeOwner: {
+    backgroundColor: "#F5E8FF",
+  },
+  roleBadgeMember: {
+    backgroundColor: "#E8FFF3",
+  },
+  roleBadgeText: {
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  roleBadgeOwnerText: {
+    color: "#6B21A8",
+  },
+  roleBadgeMemberText: {
+    color: "#047857",
+  },
 
   // 🔹 รหัสเชิญ
   codePill: {

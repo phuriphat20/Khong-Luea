@@ -13,6 +13,7 @@ import {
 import {
   collection,
   doc,
+  deleteDoc,
   onSnapshot,
   orderBy,
   query,
@@ -50,7 +51,7 @@ const parseInputDate = (value) => {
 };
 
 export default function ShoppingScreen() {
-  const { user, profile } = useContext(AppCtx);
+  const { user, profile, currentFridge } = useContext(AppCtx);
   const [items, setItems] = useState([]);
   const [busyMap, setBusyMap] = useState({});
   const [expiryDrafts, setExpiryDrafts] = useState({});
@@ -69,6 +70,16 @@ export default function ShoppingScreen() {
     );
   }, [profile?.displayName, user?.displayName, user?.email, user?.uid]);
 
+  const fridgeNameFallback = useMemo(() => {
+    if (!fridgeId) return "Shared fridge";
+    const named =
+      typeof currentFridge?.name === "string" && currentFridge.name.trim()
+        ? currentFridge.name.trim()
+        : null;
+    if (named) return named;
+    return `Fridge ${fridgeId.slice(-4).toUpperCase()}`;
+  }, [currentFridge?.name, fridgeId]);
+
   useEffect(() => {
     if (!fridgeId) {
       setItems([]);
@@ -83,10 +94,14 @@ export default function ShoppingScreen() {
         snap.forEach((d) => {
           const data = d.data() || {};
           if (data.status && data.status !== "pending") return;
+          const qty = Number(data.qty) || 0;
+          const fridgeName =
+            (typeof data.fridgeName === "string" && data.fridgeName.trim()) ||
+            fridgeNameFallback;
           arr.push({
             id: d.id,
             name: data.name || "-",
-            qty: Number(data.qty) || 0,
+            qty,
             unit: data.unit || DEFAULT_UNIT,
             barcode: data.barcode || "",
             lowThreshold:
@@ -95,6 +110,8 @@ export default function ShoppingScreen() {
                 : Number(data.lowThreshold) || 0,
             targetExpireDate: data.targetExpireDate || data.expireDate || null,
             updatedAt: data.updatedAt || null,
+            fridgeId: data.fridgeId || fridgeId,
+            fridgeName,
           });
         });
         setItems(arr);
@@ -106,7 +123,7 @@ export default function ShoppingScreen() {
       }
     );
     return () => unsub();
-  }, [fridgeId]);
+  }, [fridgeId, fridgeNameFallback]);
 
   useEffect(() => {
     setBusyMap((prev) => {
@@ -165,14 +182,15 @@ export default function ShoppingScreen() {
   };
 
   const persistExpiryDate = async (item, dateObj) => {
-    if (!fridgeId || !item?.id) return;
+    const targetFridgeId = item?.fridgeId || fridgeId;
+    if (!targetFridgeId || !item?.id) return;
     const formatted = formatInputDate(dateObj);
     if (expiryDrafts[item.id] === formatted) return;
     const previous = expiryDrafts[item.id] || "";
     setExpiryDrafts((prev) => ({ ...prev, [item.id]: formatted }));
     try {
       setBusyForItem(item.id, true);
-      await updateDoc(doc(db, "fridges", fridgeId, "shopping", item.id), {
+      await updateDoc(doc(db, "fridges", targetFridgeId, "shopping", item.id), {
         targetExpireDate: Timestamp.fromDate(dateObj),
         updatedAt: serverTimestamp(),
       });
@@ -219,7 +237,8 @@ export default function ShoppingScreen() {
   };
 
   const handleAdjustQty = async (item, delta) => {
-    if (!fridgeId || !item?.id) return;
+    const targetFridgeId = item?.fridgeId || fridgeId;
+    if (!targetFridgeId || !item?.id) return;
     const current = Number(item.qty) || 0;
     let next = current + delta;
     if (delta < 0 && current <= 1) {
@@ -238,7 +257,7 @@ export default function ShoppingScreen() {
     try {
       setBusyForItem(item.id, true);
       await updateDoc(
-        doc(db, "fridges", fridgeId, "shopping", item.id),
+        doc(db, "fridges", targetFridgeId, "shopping", item.id),
         {
           qty: next,
           updatedAt: serverTimestamp(),
@@ -252,8 +271,24 @@ export default function ShoppingScreen() {
     }
   };
 
+  const handleRemoveItem = async (item) => {
+    const targetFridgeId = item?.fridgeId || fridgeId;
+    if (!targetFridgeId || !item?.id) return;
+    try {
+      setBusyForItem(item.id, true);
+      await deleteDoc(doc(db, "fridges", targetFridgeId, "shopping", item.id));
+    } catch (err) {
+      console.warn("shopping remove item", err);
+      Alert.alert("Could not remove item", err?.message || String(err));
+      setBusyForItem(item.id, false);
+      return;
+    }
+    setBusyForItem(item.id, false);
+  };
+
   const handleMarkPurchased = async (item) => {
-    if (!fridgeId || !item?.id) return;
+    const targetFridgeId = item?.fridgeId || fridgeId;
+    if (!targetFridgeId || !item?.id) return;
     const qty = Number(item.qty) || 0;
     if (qty <= 0) {
       Alert.alert("Quantity required", "Set a quantity before marking as bought.");
@@ -268,6 +303,9 @@ export default function ShoppingScreen() {
       );
       return;
     }
+    const fridgeLabel =
+      (typeof item.fridgeName === "string" && item.fridgeName.trim()) ||
+      fridgeNameFallback;
     try {
       setBusyForItem(item.id, true);
       const batch = writeBatch(db);
@@ -277,7 +315,7 @@ export default function ShoppingScreen() {
         1,
         Math.round(Number(item.lowThreshold) || 1)
       );
-      const stockRef = doc(collection(db, "fridges", fridgeId, "stock"));
+      const stockRef = doc(collection(db, "fridges", targetFridgeId, "stock"));
       const nowTs = serverTimestamp();
       batch.set(stockRef, {
         name,
@@ -293,7 +331,7 @@ export default function ShoppingScreen() {
         updatedBy: user?.uid || null,
       });
       const historyRef = doc(
-        collection(db, "fridges", fridgeId, "stockHistory")
+        collection(db, "fridges", targetFridgeId, "stockHistory")
       );
       batch.set(historyRef, {
         type: "add",
@@ -307,10 +345,10 @@ export default function ShoppingScreen() {
         source: "shopping",
         expireDate: Timestamp.fromDate(parsedDate),
       });
-      const shoppingRef = doc(db, "fridges", fridgeId, "shopping", item.id);
+      const shoppingRef = doc(db, "fridges", targetFridgeId, "shopping", item.id);
       batch.delete(shoppingRef);
       await batch.commit();
-      Alert.alert("Restocked", `${name} (${qty} ${unit}) added to the fridge.`);
+      Alert.alert("Restocked", `${name} (${qty} ${unit}) added to ${fridgeLabel}.`);
     } catch (err) {
       console.warn("shopping mark purchased", err);
       Alert.alert("Could not restock item", err?.message || String(err));
@@ -329,6 +367,9 @@ export default function ShoppingScreen() {
     const expiryDisplay = parsedDraft
       ? parsedDraft.toLocaleDateString()
       : "Select date";
+    const fridgeLabel =
+      (typeof item.fridgeName === "string" && item.fridgeName.trim()) ||
+      fridgeNameFallback;
     return (
       <View style={styles.item}>
         <View style={styles.itemHeader}>
@@ -336,6 +377,9 @@ export default function ShoppingScreen() {
           <Text style={styles.metaText}>
             {qty} {unit}
           </Text>
+        </View>
+        <View style={styles.fridgePill}>
+          <Text style={styles.fridgePillText}>{fridgeLabel}</Text>
         </View>
         <View style={styles.expiryRow}>
           <Text style={styles.expiryLabel}>Expiry date</Text>
@@ -378,13 +422,25 @@ export default function ShoppingScreen() {
               <Text style={styles.stepperButtonText}>+</Text>
             </TouchableOpacity>
           </View>
-          <TouchableOpacity
-            style={[styles.completeBtn, (busy || qty <= 0) && styles.completeBtnDisabled]}
-            disabled={busy || qty <= 0}
-            onPress={() => handleMarkPurchased(item)}
-          >
-            <Text style={styles.completeBtnText}>Mark as bought</Text>
-          </TouchableOpacity>
+          <View style={styles.actionsColumn}>
+            <TouchableOpacity
+              style={[
+                styles.completeBtn,
+                (busy || qty <= 0) && styles.completeBtnDisabled,
+              ]}
+              disabled={busy || qty <= 0}
+              onPress={() => handleMarkPurchased(item)}
+            >
+              <Text style={styles.completeBtnText}>Mark as bought</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.removeBtn, busy && styles.removeBtnDisabled]}
+              disabled={busy}
+              onPress={() => handleRemoveItem(item)}
+            >
+              <Text style={styles.removeBtnText}>Remove</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
     );
@@ -468,6 +524,20 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
   },
+  fridgePill: {
+    alignSelf: "flex-start",
+    marginTop: 8,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: "#EEF4FF",
+  },
+  fridgePillText: {
+    color: "#1F2A5C",
+    fontWeight: "700",
+    fontSize: 12,
+  },
   name: { fontWeight: "700", fontSize: 16, color: "#1F2A5C", flex: 1, marginRight: 12 },
   metaText: { color: "#3563E9", fontWeight: "700" },
   expiryRow: {
@@ -503,9 +573,13 @@ const styles = StyleSheet.create({
   itemFooter: {
     marginTop: 16,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 16,
+  },
+  actionsColumn: {
+    flex: 1,
+    gap: 8,
   },
   stepperRow: {
     flexDirection: "row",
@@ -544,12 +618,31 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
+    alignSelf: "stretch",
   },
   completeBtnDisabled: {
     opacity: 0.5,
   },
   completeBtnText: {
     color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 14,
+  },
+  removeBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#DC2626",
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "stretch",
+  },
+  removeBtnDisabled: {
+    opacity: 0.4,
+  },
+  removeBtnText: {
+    color: "#DC2626",
     fontWeight: "700",
     fontSize: 14,
   },
