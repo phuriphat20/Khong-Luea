@@ -36,6 +36,8 @@ const AppContext = createContext({
   leaveFridge: async () => {},
   setCurrentFridge: async () => {},
   signOut: async () => {},
+  pendingJoinCode: "",
+  setPendingJoinCode: () => {},
 });
 
 const defaultDisplayName = (email, fallback = "New member") => {
@@ -52,6 +54,7 @@ export function AppProvider({ children }) {
   const [currentFridge, setCurrentFridgeState] = useState(null);
   const [profileReady, setProfileReady] = useState(false);
   const [membershipsReady, setMembershipsReady] = useState(false);
+  const [pendingJoinCode, setPendingJoinCode] = useState("");
 
   const profileUnsubRef = useRef(null);
   const membershipsUnsubRef = useRef(null);
@@ -327,13 +330,11 @@ export function AppProvider({ children }) {
       { merge: true }
     );
 
-    if (!profile?.currentFridgeId) {
-      batch.set(
-        doc(db, "users", user.uid),
-        { currentFridgeId: fridgeId },
-        { merge: true }
-      );
-    }
+    batch.set(
+      doc(db, "users", user.uid),
+      { currentFridgeId: fridgeId },
+      { merge: true }
+    );
 
     await batch.commit();
     return fridgeId;
@@ -453,8 +454,10 @@ export function AppProvider({ children }) {
       leaveFridge,
       setCurrentFridge,
       signOut: handleSignOut,
+      pendingJoinCode,
+      setPendingJoinCode,
     }),
-    
+
     [
       user,
       profile,
@@ -466,6 +469,8 @@ export function AppProvider({ children }) {
       leaveFridge,
       setCurrentFridge,
       handleSignOut,
+      pendingJoinCode,
+      setPendingJoinCode,
     ]
   );
 
@@ -475,3 +480,4 @@ export function AppProvider({ children }) {
 export const useAppContext = () => useContext(AppContext);
 
 export default AppContext;
+

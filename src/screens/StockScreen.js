@@ -1,4 +1,4 @@
-﻿import { useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -20,11 +20,14 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   Timestamp,
+  where,
   writeBatch,
 } from "firebase/firestore";
 import AppCtx from "../context/AppContext";
@@ -33,6 +36,7 @@ import { db } from "../services/firebaseConnected";
 const THREE_DAYS = 3 * 24 * 3600 * 1000;
 const DEFAULT_UNIT = "pcs";
 const OTHER_UNIT_VALUE = "__other__";
+const MAX_STEPPER_QTY = 9999;
 const UNIT_OPTIONS = [
   "pcs",
   "pack",
@@ -88,13 +92,23 @@ const aggregateStockItems = (items) => {
   items.forEach((item) => {
     const normName = (item.name || "").trim();
     const unit = item.unit || DEFAULT_UNIT;
-    const expireKey = item.expireDate?.toMillis?.() || "none";
+    const expireMs = item.expireDate?.toMillis?.() ?? null;
+    const expireKey = expireMs ?? "none";
     const key = `${item.fridgeId}|${normName.toLowerCase()}|${unit.toLowerCase()}|${expireKey}`;
     const lowThreshold = Number(item.lowThreshold) || 0;
+    const sourceEntry = {
+      id: item.id,
+      qty: Number(item.qty) || 0,
+      lowThreshold,
+      expireDate: item.expireDate || null,
+      expireMs,
+      createdAt: item.createdAt || null,
+    };
     if (map.has(key)) {
       const entry = map.get(key);
-      entry.qty += item.qty;
+      entry.qty += sourceEntry.qty;
       entry.lowThreshold += lowThreshold;
+      entry.sources.push(sourceEntry);
       entry._isExpiring = entry._isExpiring || item._isExpiring;
       entry._isLow =
         entry.lowThreshold > 0 ? entry.qty <= entry.lowThreshold : false;
@@ -102,18 +116,19 @@ const aggregateStockItems = (items) => {
     } else {
       const expireDate = item.expireDate || null;
       const isLow =
-        lowThreshold > 0 ? item.qty <= lowThreshold : item._isLow || false;
+        lowThreshold > 0 ? sourceEntry.qty <= lowThreshold : item._isLow || false;
       map.set(key, {
         ...item,
         id: key,
         name: normName,
         unit,
         expireDate,
-        qty: item.qty,
+        qty: sourceEntry.qty,
         lowThreshold,
         _isExpiring: item._isExpiring,
         _isLow: isLow,
         ids: [item.id],
+        sources: [sourceEntry],
       });
     }
   });
@@ -127,18 +142,18 @@ const aggregateStockItems = (items) => {
 };
 
 export default function StockScreen() {
-  const { user, profile } = useContext(AppCtx);
+  const { user, profile, setCurrentFridge } = useContext(AppCtx);
   const currentUserName =
     profile?.displayName?.trim() ||
     user?.displayName?.trim() ||
     user?.email ||
     (user?.uid ? `Member ${user.uid.slice(-4).toUpperCase()}` : "Unknown member");
-  const initialFilter = "none";
+  const initialFilter = "items";
   const [memberFridgeIds, setMemberFridgeIds] = useState([]);
   const [fridgeMeta, setFridgeMeta] = useState({});
   const [stock, setStock] = useState([]);
   const [history, setHistory] = useState([]);
-  const [activeFilter, setActiveFilter] = useState(initialFilter); // none | all | exp | low
+  const [activeFilter, setActiveFilter] = useState(initialFilter); // items | exp | low | none
   const [loadingStock, setLoadingStock] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -157,6 +172,8 @@ export default function StockScreen() {
   const [customUnitModalOpen, setCustomUnitModalOpen] = useState(false);
   const [customUnitDraft, setCustomUnitDraft] = useState("");
   const [userNameCache, setUserNameCache] = useState({});
+  const [plannedRemovals, setPlannedRemovals] = useState({});
+  const [actionBusy, setActionBusy] = useState({});
 
   useEffect(() => {
     if (user?.uid && currentUserName) {
@@ -321,6 +338,9 @@ export default function StockScreen() {
         expireDate: data.expireDate || null,
         barcode: data.barcode || "",
         lowThreshold,
+        status: data.status || "in_stock",
+        createdAt: data.createdAt || null,
+        updatedAt: data.updatedAt || null,
       };
       item._isExpiring = !!(expireMs && expireMs - now <= THREE_DAYS);
       item._isLow = lowThreshold > 0 && qty <= lowThreshold;
@@ -351,6 +371,20 @@ export default function StockScreen() {
     return () => unsubscribes.forEach((fn) => fn && fn());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stockFridgeKey]);
+
+  useEffect(() => {
+    setPlannedRemovals((prev) => {
+      const next = {};
+      let changed = false;
+      stock.forEach((item) => {
+        const previousValue = prev[item.id] ?? 1;
+        next[item.id] = previousValue;
+        if (prev[item.id] !== previousValue) changed = true;
+      });
+      if (Object.keys(prev).length !== Object.keys(next).length) changed = true;
+      return changed ? next : prev;
+    });
+  }, [stock]);
 
   useEffect(() => {
     const missing = history
@@ -451,7 +485,7 @@ export default function StockScreen() {
   const filteredItems = useMemo(() => {
     if (activeFilter === "exp") return stock.filter((item) => item._isExpiring);
     if (activeFilter === "low") return stock.filter((item) => item._isLow);
-    if (activeFilter === "all") return stock;
+    if (activeFilter === "items") return stock.filter((item) => !item._isLow);
     if (activeFilter === "none") return [];
     return stock;
   }, [stock, activeFilter]);
@@ -459,13 +493,43 @@ export default function StockScreen() {
     let totalQty = 0;
     let expCount = 0;
     let lowCount = 0;
+    let itemCount = 0;
     stock.forEach((item) => {
-      totalQty += Number(item.qty) || 0;
+      const qty = Number(item.qty) || 0;
+      totalQty += qty;
       if (item._isExpiring) expCount += 1;
-      if (item._isLow) lowCount += 1;
+      if (item._isLow) {
+        lowCount += 1;
+      } else if (qty > 0) {
+        itemCount += 1;
+      }
     });
-    return { totalQty, expCount, lowCount };
+    return { totalQty, expCount, lowCount, itemCount };
   }, [stock]);
+  const getPlannedQty = (item) => Math.max(1, plannedRemovals[item.id] ?? 1);
+  const adjustPlannedQty = (item, delta) => {
+    setPlannedRemovals((prev) => {
+      const current = prev[item.id] ?? 1;
+      let next = current + delta;
+      if (next < 1) next = 1;
+      if (next > MAX_STEPPER_QTY) next = MAX_STEPPER_QTY;
+      if (next === current) return prev;
+      return { ...prev, [item.id]: next };
+    });
+  };
+  const setPlannedQty = (item, value) => {
+    setPlannedRemovals((prev) => {
+      const safe = Math.min(Math.max(value, 1), MAX_STEPPER_QTY);
+      if (prev[item.id] === safe) return prev;
+      return { ...prev, [item.id]: safe };
+    });
+  };
+  const setBusyForItem = (itemId, value) => {
+    setActionBusy((prev) => {
+      if (prev[itemId] === value) return prev;
+      return { ...prev, [itemId]: value };
+    });
+  };
 
   const addItem = async () => {
     const targetFridgeId = selectedFridgeId;
@@ -553,6 +617,169 @@ export default function StockScreen() {
       setShowAdd(false);
     } catch (err) {
       Alert.alert("Could not save item", err.message || "Something went wrong");
+    }
+  };
+
+  const handleAddToShopping = async (item) => {
+    const qty = getPlannedQty(item);
+    if (!item?.fridgeId) return;
+    if (qty <= 0) {
+      Alert.alert("Quantity required", "Select at least 1 before adding to the shopping list.");
+      return;
+    }
+    try {
+      setBusyForItem(item.id, true);
+      const listCol = collection(db, "fridges", item.fridgeId, "shopping");
+      const normalized = (item.name || "").trim().toLowerCase();
+      const existingQuery = query(
+        listCol,
+        where("nameLower", "==", normalized),
+        limit(1)
+      );
+      const existingSnap = await getDocs(existingQuery);
+      let targetDocSnap = !existingSnap.empty ? existingSnap.docs[0] : null;
+      if (!targetDocSnap) {
+        const fallbackSnap = await getDocs(
+          query(listCol, where("name", "==", item.name), limit(1))
+        );
+        if (!fallbackSnap.empty) {
+          targetDocSnap = fallbackSnap.docs[0];
+        }
+      }
+      const batch = writeBatch(db);
+      const fridgeLabel =
+        (typeof fridgeMeta[item.fridgeId]?.name === "string" &&
+          fridgeMeta[item.fridgeId].name.trim()) ||
+        `Fridge ${item.fridgeId.slice(-4).toUpperCase()}`;
+      if (targetDocSnap) {
+        const prevQty = Number(targetDocSnap.data()?.qty) || 0;
+        batch.update(targetDocSnap.ref, {
+          qty: prevQty + qty,
+          unit: item.unit,
+          status: "pending",
+          updatedAt: serverTimestamp(),
+          nameLower: normalized,
+          lowThreshold:
+            Number(targetDocSnap.data()?.lowThreshold) ||
+            Math.max(1, Math.round(Number(item.lowThreshold) || 1)),
+          fridgeId: item.fridgeId,
+          fridgeName: fridgeLabel,
+        });
+      } else {
+        const newRef = doc(listCol);
+        batch.set(newRef, {
+          name: item.name,
+          nameLower: normalized,
+          qty,
+          unit: item.unit,
+          status: "pending",
+          lowThreshold: Math.max(1, Math.round(Number(item.lowThreshold) || 1)),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          fridgeId: item.fridgeId,
+          fridgeName: fridgeLabel,
+        });
+      }
+      await batch.commit();
+      if (
+        typeof setCurrentFridge === "function" &&
+        profile?.currentFridgeId !== item.fridgeId
+      ) {
+        setCurrentFridge(item.fridgeId).catch((err) =>
+          console.warn("sync current fridge after shopping add failed", err)
+        );
+      }
+      Alert.alert(
+        "Added to shopping list",
+        `${item.name} (${qty} ${item.unit}) added to the shopping list.`
+      );
+    } catch (err) {
+      console.warn("add to shopping failed", err);
+      Alert.alert(
+        "Could not update shopping list",
+        err?.message || String(err)
+      );
+    } finally {
+      setBusyForItem(item.id, false);
+    }
+  };
+
+  const handleRemoveFromStock = async (item) => {
+    const qty = getPlannedQty(item);
+    const available = Number(item?.qty) || 0;
+    if (!item?.fridgeId) return;
+    if (qty <= 0) {
+      Alert.alert("Quantity required", "Select at least 1 before removing from the fridge.");
+      return;
+    }
+    if (qty > available) {
+      Alert.alert(
+        "Not enough stock",
+        `You only have ${available} ${item.unit} available in this fridge.`
+      );
+      return;
+    }
+    try {
+      setBusyForItem(item.id, true);
+      const batch = writeBatch(db);
+      let remaining = qty;
+      const sources = (item.sources || []).slice().sort((a, b) => {
+        const aMs = typeof a.expireMs === "number" ? a.expireMs : Number.MAX_SAFE_INTEGER;
+        const bMs = typeof b.expireMs === "number" ? b.expireMs : Number.MAX_SAFE_INTEGER;
+        if (aMs !== bMs) return aMs - bMs;
+        const aCreated =
+          typeof a.createdAt?.toMillis === "function" ? a.createdAt.toMillis() : Number.MAX_SAFE_INTEGER;
+        const bCreated =
+          typeof b.createdAt?.toMillis === "function" ? b.createdAt.toMillis() : Number.MAX_SAFE_INTEGER;
+        return aCreated - bCreated;
+      });
+      for (const source of sources) {
+        if (remaining <= 0) break;
+        const availableInDoc = Number(source.qty) || 0;
+        if (availableInDoc <= 0) continue;
+        const take = Math.min(availableInDoc, remaining);
+        const ref = doc(db, "fridges", item.fridgeId, "stock", source.id);
+        const nextQty = availableInDoc - take;
+        if (nextQty <= 0) {
+          batch.delete(ref);
+        } else {
+          batch.update(ref, {
+            qty: nextQty,
+            status:
+              nextQty <= (Number(source.lowThreshold) || 0) ? "low" : "in_stock",
+            updatedAt: serverTimestamp(),
+            updatedBy: user?.uid || null,
+          });
+        }
+        remaining -= take;
+      }
+      if (remaining > 0) {
+        throw new Error("Not enough stock available to remove the requested amount.");
+      }
+      const historyRef = doc(
+        collection(db, "fridges", item.fridgeId, "stockHistory")
+      );
+      batch.set(historyRef, {
+        type: "remove",
+        name: item.name,
+        qty,
+        unit: item.unit,
+        stockId: item.sources && item.sources.length === 1 ? item.sources[0].id : null,
+        byUid: user?.uid || null,
+        byName: currentUserName,
+        ts: serverTimestamp(),
+      });
+      await batch.commit();
+      Alert.alert(
+        "Removed from fridge",
+        `${qty} ${item.unit} removed from ${item.name}.`
+      );
+      setPlannedQty(item, 1);
+    } catch (err) {
+      console.warn("remove stock failed", err);
+      Alert.alert("Could not remove item", err?.message || String(err));
+    } finally {
+      setBusyForItem(item.id, false);
     }
   };
 
@@ -646,13 +873,13 @@ export default function StockScreen() {
   };
 
   const statCards = [
-    { key: "all", label: "All items", value: stats.totalQty },
+    { key: "items", label: "Items", value: stats.itemCount },
     { key: "exp", label: "Expiring soon", value: stats.expCount },
     { key: "low", label: "Low stock", value: stats.lowCount },
   ];
 
   const headerTitle = "All fridges overview";
-  const headerSubtitle = `Tracking ${fridgeCount} fridge${fridgeCount === 1 ? "" : "s"} - tap a category to filter items.`;
+  const headerSubtitle = `Tracking ${fridgeCount} fridge${fridgeCount === 1 ? "" : "s"} - ${stats.totalQty} total ${stats.totalQty === 1 ? "unit" : "units"} in stock. Tap a tab to filter items.`;
   const showHistoryOnly = activeFilter === "none";
 
   const renderItem = ({ item }) => {
@@ -664,6 +891,9 @@ export default function StockScreen() {
     if (item._isLow) badges.push({ text: "Low stock", tone: "danger" });
     const available = Number(item.qty) || 0;
     const expiresOn = formatDate(item.expireDate);
+    const plannedQty = getPlannedQty(item);
+    const busy = !!actionBusy[item.id];
+    const disableRemove = busy || available <= 0;
 
     return (
       <View style={styles.card}>
@@ -707,6 +937,59 @@ export default function StockScreen() {
         <View style={[styles.metaRow, { marginTop: 12 }]}>
           <Text style={styles.metaLabel}>Expires on</Text>
           <Text style={styles.metaValue}>{expiresOn}</Text>
+        </View>
+
+        <View style={styles.steppersRow}>
+          <TouchableOpacity
+            style={[
+              styles.stepperButton,
+              (plannedQty <= 1 || busy) && styles.stepperButtonDisabled,
+            ]}
+            onPress={() => adjustPlannedQty(item, -1)}
+            disabled={plannedQty <= 1 || busy}
+          >
+            <Text style={styles.stepperButtonText}>-</Text>
+          </TouchableOpacity>
+          <Text style={styles.stepperValue}>{plannedQty}</Text>
+          <TouchableOpacity
+            style={[
+              styles.stepperButton,
+              (plannedQty >= MAX_STEPPER_QTY || busy) && styles.stepperButtonDisabled,
+            ]}
+            onPress={() => adjustPlannedQty(item, 1)}
+            disabled={plannedQty >= MAX_STEPPER_QTY || busy}
+          >
+            <Text style={styles.stepperButtonText}>+</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.cardActionsRow}>
+          <TouchableOpacity
+            style={[styles.secondaryActionButton, busy && styles.actionButtonDisabled]}
+            disabled={busy}
+            onPress={() => handleAddToShopping(item)}
+          >
+            <Text
+              style={[
+                styles.secondaryActionText,
+                busy && styles.actionButtonTextDisabled,
+              ]}
+            >
+              Add to shopping list
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.primaryActionButton,
+              disableRemove && styles.actionButtonDisabled,
+            ]}
+            disabled={disableRemove}
+            onPress={() => handleRemoveFromStock(item)}
+          >
+            <Text style={styles.primaryActionText}>
+              Remove from fridge
+            </Text>
+          </TouchableOpacity>
         </View>
       </View>
     );
@@ -1338,6 +1621,74 @@ const styles = StyleSheet.create({
   metaValue: {
     color: "#1F2A5C",
     fontWeight: "600",
+  },
+  steppersRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginTop: 16,
+  },
+  stepperButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  stepperButtonDisabled: {
+    opacity: 0.4,
+  },
+  stepperButtonText: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#1F2A5C",
+  },
+  stepperValue: {
+    minWidth: 44,
+    textAlign: "center",
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#1F2A5C",
+  },
+  cardActionsRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 16,
+  },
+  secondaryActionButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  secondaryActionText: {
+    color: "#1F2A5C",
+    fontWeight: "700",
+  },
+  primaryActionButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: "#EB5757",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  primaryActionText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+  },
+  actionButtonDisabled: {
+    opacity: 0.5,
+  },
+  actionButtonTextDisabled: {
+    color: "#9CA3AF",
   },
   sectionTitle: {
     fontSize: 16,
